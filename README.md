@@ -1,4 +1,4 @@
-# 🦙 Ollama Farm + GPU Setup + NKN Relay — README
+# 🦙 Ollama Farm + GPU Setup + NKN Relay
 
 This guide explains three pieces that work together:
 
