@@ -1,0 +1,1098 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Ollama Relay Playground</title>
+  <style>
+    :root {
+      --bg: #0b0f14;
+      --panel: rgba(255, 255, 255, 0.07);
+      --panel-2: rgba(255, 255, 255, 0.05);
+      --accent: #66e0ff;
+      --accent-2: #a8ff60;
+      --text: #e8f1f8;
+      --muted: #a9b6c3;
+      --danger: #ff6b6b;
+      --ok: #7dffb0;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      --radius: 16px;
+      --shadow: 0 10px 30px rgba(0,0,0,.35), inset 0 0 1px rgba(255,255,255,.12);
+    }
+    * { box-sizing: border-box }
+    html, body { height: 100% }
+    body {
+      margin: 0; color: var(--text);
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Noto Sans, Ubuntu, Cantarell, Helvetica Neue, Arial;
+      line-height: 1.3; background: transparent; position: relative;
+    }
+    body::after{
+      content:''; z-index:-1; top:0; position:fixed; width:100vw; height:100vh;
+      background: radial-gradient(1200px 800px at 10% -10%, #163147, transparent 60%),
+                  radial-gradient(900px 600px at 100% 0%, #1b2d18, transparent 55%), var(--bg);
+    }
+    header{ padding:24px 20px; display:flex; gap:18px; align-items:center; justify-content:space-between }
+    .brand{ display:flex; gap:14px; align-items:center; letter-spacing:.4px }
+    .logo{ width:40px; height:40px; border-radius:12px; background: conic-gradient(from 220deg, var(--accent), #9f78ff, var(--accent-2)); box-shadow: var(--shadow) }
+    .brand h1{ font-size:18px; margin:0; font-weight:700 }
+    .hint{ color:var(--muted); font-size:12px }
+    .grid{ display:grid; gap:16px; padding:0 20px 24px; grid-template-columns: repeat(12, 1fr) }
+    .card{
+      grid-column: span 12; background:var(--panel); border:1px solid rgba(255,255,255,.08);
+      border-radius: var(--radius); box-shadow: var(--shadow); backdrop-filter: blur(8px); padding:16px
+    }
+    @media (min-width:1080px){
+      .span-6{ grid-column: span 6 }
+      .span-4{ grid-column: span 4 }
+      .span-8{ grid-column: span 8 }
+      .span-3{ grid-column: span 3 }
+    }
+    .card h2{ margin:0 0 8px; font-size:16px }
+    .row{ display:flex; flex-wrap:wrap; gap:10px; align-items:center }
+    .row>*{ margin:2px 0 }
+    label{ font-size:12px; color:var(--muted); margin-right:6px }
+    input[type="text"], input[type="url"], input[type="number"], textarea, select{
+      width:100%; background:var(--panel-2); color:var(--text);
+      border:1px solid rgba(255,255,255,.15); padding:10px 12px; border-radius:12px; outline:none; font-size:14px
+    }
+    #chatMsgList{ height:max-content; max-height:1024px; }
+    textarea{ resize:vertical; min-height:84px }
+    input[type="file" i]::file-selector-button, button{
+      background: linear-gradient(180deg, rgba(102,224,255,.9), rgba(102,224,255,.6));
+      color:#001018; border:0; padding:10px 14px; font-weight:700; border-radius:12px; cursor:pointer;
+      transition:.15s transform ease, .15s filter ease;
+      box-shadow: 0 6px 16px rgba(72,218,255,.25), inset 0 0 1px rgba(255,255,255,.6)
+    }
+    button.secondary{
+      background: linear-gradient(180deg, rgba(168,255,96,.9), rgba(168,255,96,.6));
+      color:#021204; box-shadow:0 6px 16px rgba(168,255,96,.20), inset 0 0 1px rgba(255,255,255,.6)
+    }
+    button.ghost{ background:transparent; color:var(--text); border:1px solid rgba(255,255,255,.2) }
+    optgroup{ background:#333333 } option{ background:#222222 }
+    .badge{ display:inline-flex; align-items:center; gap:8px; padding:8px 10px; border-radius:999px; border:1px solid rgba(255,255,255,.15); background:rgba(255,255,255,.05) }
+    .dot{ width:10px; height:10px; border-radius:50%; background:#999 } .dot.ok{ background:var(--ok); box-shadow:0 0 12px var(--ok) } .dot.warn{ background:#f9c846; box-shadow:0 0 12px #f9c846 } .dot.err{ background:var(--danger); box-shadow:0 0 12px var(--danger) }
+    .code{ background:#04070b; border:1px solid rgba(255,255,255,.12); border-radius:12px; padding:12px; font-family:var(--mono); font-size:12px; white-space:pre-wrap; color:#d7f0ff; max-height:300px; overflow:auto }
+    .muted{ color:var(--muted); font-size:12px } .small{ font-size:11px; color:var(--muted) }
+    .two-col{ display:grid; grid-template-columns:1fr 1fr; gap:8px }
+    .chat-wrap{ display:grid; grid-template-rows:auto auto 1fr auto; gap:10px; height:auto }
+    .chat-toolbar{ display:flex; gap:8px; flex-wrap:wrap; align-items:center }
+    .chat-stream{ background:#04070b; border:1px solid rgba(255,255,255,.12); border-radius:12px; padding:10px; overflow:auto }
+    .bubble{ max-width:78%; padding:10px 12px; border-radius:14px; margin:6px 0; white-space:pre-wrap }
+    .bubble.user{ background:rgba(255,255,255,.08); margin-left:auto }
+    .bubble.assistant{ background:rgba(102,224,255,.14); border:1px solid rgba(102,224,255,.25) }
+    .msg-list{ height:100%; overflow:auto; padding:6px }
+    .chat-input{ display:flex; gap:8px }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/nkn-sdk@1.3.6/dist/nkn.min.js"></script>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <div class="logo"></div>
+    <div>
+      <h1>Ollama Relay Playground</h1>
+      <div class="hint">Generate · Chat · Create · Tags · Show · Copy · Delete · Pull/Push · Embed · PS · Version · Blobs</div>
+    </div>
+  </div>
+  <div id="status" class="badge"><span class="dot warn"></span><span>Checking…</span></div>
+</header>
+
+<main class="grid">
+  <!-- SETTINGS -->
+  <section class="card span-6">
+    <h2>Settings</h2>
+    <div class="row" style="gap:12px">
+      <label>Transport</label>
+      <select id="transport">
+        <option value="http">HTTP(S) Direct</option>
+        <option value="nkn">NKN Relay (DM)</option>
+      </select>
+
+      <label>Base URL</label>
+      <input id="baseUrl" type="url" placeholder="http://127.0.0.1:11434"/>
+
+      <label>Relay NKN Address</label>
+      <input id="relayAddr" type="text" placeholder="(full NKN address incl. identifier)"/>
+
+      <label>Auth (optional)</label>
+      <input id="apiKey" type="text" placeholder="X-API-Key or Bearer token"/>
+    </div>
+
+    <div class="row" style="margin-top:10px;">
+      <span class="muted">NKN: <span id="nknInfo">disconnected</span></span>
+      <div class="row" style="margin-left:auto;">
+        <button id="nknConnectBtn">Connect NKN</button>
+        <button class="ghost" id="nknDisconnectBtn">Disconnect</button>
+        <button class="ghost" id="saveBtn">Save</button>
+      </div>
+    </div>
+    <div class="small" style="margin-top:8px;">Tip: Use HTTP mode for large file uploads to
+      <code>/api/blobs/:digest</code>.
+    </div>
+  </section>
+
+  <!-- INSPECT -->
+  <section class="card span-6">
+    <h2>Inspect</h2>
+    <div class="row" style="gap:8px">
+      <button id="listModels">GET /api/tags</button>
+      <button id="listPS">GET /api/ps</button>
+      <button id="getVersion">GET /api/version</button>
+    </div>
+    <div id="inspectBox" class="code" style="margin-top:8px; display:none;"></div>
+  </section>
+
+  <!-- GENERATE -->
+  <section class="card span-6">
+    <h2>Generate (POST /api/generate)</h2>
+    <div class="row" style="gap:8px">
+      <label>Model</label><input type="text" id="genModel" placeholder="e.g. llama3.1:8b"/>
+      <label>Stream</label>
+      <select id="genStream">
+        <option value="true" selected>true</option>
+        <option value="false">false</option>
+      </select>
+    </div>
+    <textarea id="genPrompt" placeholder="Write a haiku about databases."></textarea>
+    <div class="two-col">
+      <textarea id="genFormat" placeholder='Optional "format": "json" or JSON schema'></textarea>
+      <textarea id="genOptions" placeholder='Optional "options": {...} (JSON)'></textarea>
+    </div>
+    <div class="row" style="gap:8px;margin-top:8px;">
+      <button id="genGo">Send</button>
+      <span class="muted">Streams NDJSON unless <code>stream:false</code>.</span>
+    </div>
+    <div id="genOut" class="code" style="margin-top:8px; display:none;"></div>
+  </section>
+
+  <!-- CHAT -->
+  <section class="card span-6">
+    <h2>Chat (POST /api/chat)</h2>
+    <div class="chat-wrap">
+      <div class="chat-toolbar">
+        <label>Model</label>
+        <select id="chatModelSelect" style="min-width:260px"></select>
+
+        <label>Session</label>
+        <select id="chatSessionSelect" style="min-width:200px"></select>
+        <button class="secondary" id="chatNewSession">New</button>
+        <button class="ghost" id="chatRenameSession">Rename</button>
+        <button class="ghost" id="chatDeleteSession">Delete</button>
+
+        <label>Stream</label>
+        <select id="chatStream">
+          <option value="true" selected>true</option>
+          <option value="false">false</option>
+        </select>
+
+        <input type="file" id="chatUpload" accept="application/json" style="margin-left:auto"/>
+        <button id="chatDownload">Download JSON</button>
+      </div>
+
+      <textarea id="chatSystem" placeholder="System message (optional)"></textarea>
+
+      <div id="chatMsgList" class="msg-list"></div>
+
+      <div class="chat-input">
+        <textarea id="chatUserInput" placeholder="Type your message…"></textarea>
+        <button id="chatSend">Send</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- MODEL ADMIN -->
+  <section class="card span-6">
+    <h2>Model Admin</h2>
+    <div class="row" style="gap:8px">
+      <label>Create model</label><input type="text" id="createModelName" placeholder="new-name[:tag]"/>
+      <button class="secondary" id="createFromModel">POST /api/create (from model)</button>
+    </div>
+    <div class="two-col">
+      <textarea id="createSystem" placeholder='system (string)'></textarea>
+      <textarea id="createTemplate" placeholder='template (string)'></textarea>
+    </div>
+    <div class="two-col">
+      <textarea id="createParams" placeholder='parameters (JSON)'></textarea>
+      <textarea id="createMessages" placeholder='messages (JSON)'></textarea>
+    </div>
+    <hr style="border:none;border-top:1px solid rgba(255,255,255,.15);margin:12px 0"/>
+    <div class="row" style="gap:8px">
+      <label>Show</label><input type="text" id="showModel" placeholder="model[:tag]"/>
+      <button id="showBtn">POST /api/show</button>
+      <label>Verbose</label>
+      <select id="showVerbose">
+        <option value="false">false</option>
+        <option value="true">true</option>
+      </select>
+    </div>
+    <div class="row" style="gap:8px">
+      <label>Copy</label><input type="text" id="copySrc" placeholder="source model"/>
+      <input type="text" id="copyDst" placeholder="destination"/>
+      <button id="copyBtn">POST /api/copy</button>
+    </div>
+    <div class="row" style="gap:8px">
+      <label>Delete</label><input type="text" id="deleteModel" placeholder="model to delete"/>
+      <button id="deleteBtn">DELETE /api/delete</button>
+    </div>
+    <div id="adminOut" class="code" style="margin-top:8px; display:none;"></div>
+  </section>
+
+  <!-- PULL / PUSH -->
+  <section class="card span-6">
+    <h2>Pull / Push</h2>
+    <div class="row" style="gap:8px">
+      <label>Pull</label><input type="text" id="pullModelName" placeholder="model[:tag]"/>
+      <button class="secondary" id="pullModel">POST /api/pull</button>
+    </div>
+    <div class="row" style="gap:8px">
+      <label>Push</label><input type="text" id="pushModelName" placeholder="namespace/model:tag"/>
+      <button class="secondary" id="pushModel">POST /api/push</button>
+    </div>
+    <div id="pullPushOut" class="code" style="margin-top:8px; display:none;"></div>
+  </section>
+
+  <!-- EMBEDDINGS -->
+  <section class="card span-6">
+    <h2>Embeddings</h2>
+    <div class="row" style="gap:8px">
+      <label>Model</label><input type="text" id="embModel" placeholder="e.g. all-minilm"/>
+      <label>Endpoint</label>
+      <select id="embEndpoint">
+        <option value="embed" selected>/api/embed</option>
+        <option value="embeddings">/api/embeddings (legacy)</option>
+      </select>
+    </div>
+    <textarea id="embInput"
+              placeholder='For /api/embed: "input" can be string or ["...","..."]. For legacy /api/embeddings: uses "prompt".'></textarea>
+    <div class="two-col">
+      <textarea id="embOptions" placeholder='Optional "options": {...} (JSON)'></textarea>
+      <textarea id="embKeepAlive" placeholder='Optional "keep_alive": "5m" (string)'></textarea>
+    </div>
+    <div class="row" style="gap:8px;margin-top:8px;">
+      <button id="embGo">Send</button>
+    </div>
+    <div id="embOut" class="code" style="margin-top:8px; display:none;"></div>
+  </section>
+
+  <!-- BLOBS -->
+  <section class="card span-6">
+    <h2>Blobs (/api/blobs/:digest)</h2>
+    <div class="row" style="gap:8px">
+      <input type="text" id="blobDigest" placeholder="sha256:..."/>
+      <button id="blobHead">HEAD (check exists)</button>
+    </div>
+    <div class="row" style="gap:8px">
+      <input type="file" id="blobFile"/>
+      <button id="blobPush">POST (upload)</button>
+      <span class="muted">HTTP mode recommended for big files; NKN path allows small files only.</span>
+    </div>
+    <div id="blobOut" class="code" style="margin-top:8px; display:none;"></div>
+  </section>
+
+  <!-- STATUS / LOGS -->
+  <section class="card span-6">
+    <h2>Status / Logs</h2>
+    <div id="statusBox" class="code" style="display:block;min-height:80px;">(logs)</div>
+  </section>
+</main>
+
+<script>
+/* ===================== STATE ===================== */
+const STREAM_GRACE_MS = 240; // grace window to accept late line batches after end
+const S = {
+  transport: localStorage.getItem('ollama.transport') || 'http',
+  base: localStorage.getItem('ollama.base') || 'http://127.0.0.1:11434',
+  relayAddr: localStorage.getItem('ollama.relayAddr') || '',
+  apiKey: localStorage.getItem('ollama.apiKey') || '',
+  models: [],
+  _modelsReqInFlight: false,
+  _modelsLastReq: 0,
+  _modelsRetryTimer: null,
+  _modelsRequestsIssued: 0,
+  nkn: { client: null, addr: '', ready: false, pending: new Map(), streams: new Map(), nextId: 1, readyCbs: [] },
+  chat: {
+    key: 'ollama.chat.v1',
+    byModel: {},          // { [model]: { sessions: { [sid]: {name, system, messages: [...], updatedAt} }, lastUsedSid } }
+    currentModel: null,
+    sid: null
+  }
+};
+
+/* ===================== HELPERS ===================== */
+function qs(id){ return document.getElementById(id) }
+function log(s){ const el = qs('statusBox'); el.textContent += `\n${s}`; el.scrollTop = el.scrollHeight; }
+function j(x){ try{ return JSON.stringify(x, null, 2) } catch{ return String(x) } }
+function parseMaybeJSON(txt){ const t=(txt||'').trim(); if(!t) return undefined; try{ return JSON.parse(t); } catch{ return t; } }
+function downloadJSON(filename, obj){ const blob = new Blob([JSON.stringify(obj, null, 2)],{type:'application/json'}); const url = URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download=filename; a.click(); setTimeout(()=>URL.revokeObjectURL(url),500); }
+function b64ToBytes(b64){ const bin=atob(b64); const len=bin.length; const out=new Uint8Array(len); for(let i=0;i<len;i++) out[i]=bin.charCodeAt(i); return out; }
+function bytesToB64(arr){ let bin=''; const bytes=new Uint8Array(arr); for(let i=0;i<bytes.length;i++) bin+=String.fromCharCode(bytes[i]); return btoa(bin); }
+function reflectTransportUI(){ qs('nknInfo').textContent = (S.transport==='nkn' ? (S.nkn.ready ? `connected • ${S.nkn.addr.slice(0,10)}…` : 'connecting…') : 'disabled'); }
+function authHeaders(h={}){ const headers=Object.assign({}, h); if(!headers['Content-Type']) headers['Content-Type']='application/json'; if(S.apiKey){ if(S.apiKey.startsWith('Bearer ')) headers['Authorization']=S.apiKey; else headers['X-API-Key']=S.apiKey; } return headers; }
+function toast(txt, ok=true){ const st=qs('status'); st.innerHTML = `<span class="dot ${ok?'ok':'err'}"></span><span>${txt}</span>`; setTimeout(()=>{ st.innerHTML = `<span class="dot ok"></span><span>Ready</span>`; }, 1400); }
+function ensureModelsLoadedWithRetry(delayMs=5000){
+  const issuedAt = S._modelsRequestsIssued;
+  clearTimeout(S._modelsRetryTimer);
+  S._modelsRetryTimer = setTimeout(()=>{
+    if (S._modelsRequestsIssued === issuedAt &&
+        (!Array.isArray(S.models) || S.models.length===0) &&
+        !S._modelsReqInFlight){
+      refreshModels();
+    }
+  }, delayMs);
+}
+
+/* ===================== NKN LAYER ===================== */
+function nknEnsureClient(){
+  if (S.nkn.client) return;
+  if (!window.nkn || !(window.nkn.MultiClient || window.nkn.Client)){ toast('nkn-sdk not loaded', false); return; }
+  const client = new nkn.MultiClient({ identifier: 'webui', numSubClients: 4 });
+  S.nkn.client = client;
+
+  client.on('connect', ()=>{
+    S.nkn.addr = client.addr || '';
+    S.nkn.ready = true;
+    (S.nkn.readyCbs||[]).forEach(fn=>{ try{ fn() }catch{} });
+    S.nkn.readyCbs.length = 0;
+    reflectTransportUI(); toast('NKN connected');
+    refreshModels(); ensureModelsLoadedWithRetry(5000);
+  });
+
+  client.on('message', (a,b)=>{
+    let src, payload; if (a && typeof a==='object' && a.payload!==undefined){ src=a.src; payload=a.payload; } else { src=a; payload=b; }
+    try{
+      const txt = (payload && payload.toString) ? payload.toString() : (''+payload);
+      const msg = JSON.parse(txt);
+      const ev = msg.event || ''; const id = msg.id;
+
+      // Streamed batches (ordered with seq)
+      if (ev === 'relay.response.lines' && id){
+        const ctx = S.nkn.streams.get(id); if (!ctx) return;
+        const arr = Array.isArray(msg.lines) ? msg.lines : [];
+        for (const item of arr){
+          const seq = item.seq|0;
+          ctx.buff.set(seq, item);
+          ctx.maxSeq = Math.max(ctx.maxSeq, seq);
+        }
+        _drainOrderedLines(ctx);
+
+        // If we've already seen end, rearm a short finalize window to let stragglers arrive.
+        if (ctx.ended) _scheduleFinalize(ctx, 'late-lines');
+        return;
+      }
+
+      if (ev === 'relay.response.begin' && id){
+        const ctx = S.nkn.streams.get(id); if (!ctx) return;
+        ctx.onBegin && ctx.onBegin(msg);
+        return;
+      }
+
+      if (ev === 'relay.response.keepalive' && id){
+        const ctx = S.nkn.streams.get(id); if (ctx) ctx.lastHeartbeat = Date.now();
+        return;
+      }
+
+      if (ev === 'relay.response.end' && id){
+        const ctx = S.nkn.streams.get(id); if (!ctx) return;
+        // Mark ended, then allow a final grace window for any in-flight lines to land, using seq to keep order.
+        ctx.ended = true;
+        _scheduleFinalize(ctx, 'end');
+        return;
+      }
+
+      // Non-stream single-shot
+      if (ev === 'relay.response' && id){
+        const p = S.nkn.pending.get(id); if (p){ clearTimeout(p.timer); S.nkn.pending.delete(id); p.resolve(msg); }
+      }
+
+    }catch(e){ /* ignore */ }
+  });
+
+  client.on('close', ()=>{ S.nkn.ready = false; reflectTransportUI(); });
+}
+function nknWaitReady(timeoutMs=20000){
+  return new Promise((resolve, reject)=>{
+    if (S.nkn.ready) return resolve();
+    nknEnsureClient();
+    const t = setTimeout(()=>{ cleanup(); reject(new Error('NKN connect timeout')); }, timeoutMs);
+    function onReady(){ cleanup(); resolve(); }
+    function cleanup(){ clearTimeout(t); S.nkn.readyCbs = (S.nkn.readyCbs||[]).filter(fn=>fn!==onReady); }
+    (S.nkn.readyCbs = S.nkn.readyCbs||[]).push(onReady);
+  });
+}
+async function nknSendRelayStream(reqSpec, handlers={}, timeoutMs=180000){
+  if (!S.relayAddr) throw new Error('No relay address set');
+  await nknWaitReady();
+  const client = S.nkn.client;
+  const id = 'web-' + Date.now() + '-' + (S.nkn.nextId++);
+  const ctx = {
+    id,
+    onBegin: handlers.onBegin || null,
+    onLine: handlers.onLine || null,
+    onEnd: handlers.onEnd || null,
+    onResolve: null,
+    onReject: null,
+    expected: 1,
+    buff: new Map(),
+    maxSeq: 0,
+    lastHeartbeat: Date.now(),
+    ended: false,
+    finalizeTimer: null,
+    resolved: false
+  };
+  const p = new Promise((resolve, reject)=>{
+    ctx.onResolve = (m)=>{
+      if (ctx.resolved) return;
+      ctx.resolved = true;
+      try { ctx.onEnd && ctx.onEnd(m); } catch {}
+      resolve(m);
+    };
+    ctx.onReject = (e)=>{
+      if (ctx.resolved) return;
+      ctx.resolved = true;
+      reject(e);
+    };
+  });
+
+  S.nkn.streams.set(id, ctx);
+
+  const data = { event:'http.request', id, req: Object.assign({ stream:'chunks' }, reqSpec) };
+  const timer = setTimeout(()=>{
+    if (S.nkn.streams.has(id)){
+      // flush what we have, then error out
+      try { _drainOrderedLines(ctx, true); } catch {}
+      S.nkn.streams.delete(id);
+      ctx.onReject && ctx.onReject(new Error('NKN relay timeout'));
+    }
+  }, timeoutMs);
+  p.finally(()=>clearTimeout(timer));
+
+  await client.send(S.relayAddr, JSON.stringify(data), { noReply:true, maxHoldingSeconds:120 });
+  return p;
+}
+async function nknSendRelay(reqSpec, timeoutMs=45000){
+  if (!S.relayAddr) throw new Error('No relay address set');
+  await nknWaitReady();
+  const client = S.nkn.client; const id = 'web-' + Date.now() + '-' + (S.nkn.nextId++);
+  const data = { event:'http.request', id, req: reqSpec };
+  return new Promise((resolve, reject)=>{
+    const timer = setTimeout(()=>{ S.nkn.pending.delete(id); reject(new Error('NKN relay timeout')); }, timeoutMs);
+    S.nkn.pending.set(id, { resolve, reject, timer });
+    client.send(S.relayAddr, JSON.stringify(data), { noReply:true, maxHoldingSeconds:120 })
+      .catch(err=>{ clearTimeout(timer); S.nkn.pending.delete(id); reject(err); });
+  });
+}
+function _drainOrderedLines(ctx, force=false){
+  while(true){
+    const item = ctx.buff.get(ctx.expected);
+    if (!item) break;
+    ctx.buff.delete(ctx.expected);
+    try { ctx.onLine && ctx.onLine(item.line, item.seq, item.ts); } catch {}
+    ctx.expected++;
+  }
+  if (force && ctx.buff.size){
+    const keys = Array.from(ctx.buff.keys()).sort((a,b)=>a-b);
+    for (const k of keys){
+      const item = ctx.buff.get(k);
+      try { ctx.onLine && ctx.onLine(item.line, item.seq, item.ts); } catch {}
+      ctx.buff.delete(k);
+    }
+  }
+}
+function _scheduleFinalize(ctx, reason){
+  clearTimeout(ctx.finalizeTimer);
+  ctx.finalizeTimer = setTimeout(()=>{
+    try { _drainOrderedLines(ctx, true); } catch {}
+    if (S.nkn.streams.has(ctx.id)) S.nkn.streams.delete(ctx.id);
+    ctx.onResolve && ctx.onResolve({ ok:true, reason });
+  }, STREAM_GRACE_MS);
+}
+
+/* ===================== HTTP/Relay CALLS ===================== */
+async function callJSON(path, bodyObj, extraHeaders, method='POST'){
+  if (S.transport === 'nkn'){
+    const req = { url: S.base.replace(/\/+$/, '')+path, method, headers: authHeaders(extraHeaders||{}), json: bodyObj ?? {}, timeout_ms: 120000 };
+    const resp = await nknSendRelay(req, req.timeout_ms);
+    if (!resp || resp.ok===false) throw new Error((resp && resp.error) || ('HTTP '+(resp && resp.status)));
+    return resp.json ?? (resp.body_b64 ? JSON.parse(new TextDecoder('utf-8').decode(b64ToBytes(resp.body_b64))) : null);
+  }
+  const res = await fetch(S.base.replace(/\/+$/, '')+path, { method, headers: authHeaders(extraHeaders), body: bodyObj ? JSON.stringify(bodyObj) : undefined });
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  return res.json();
+}
+async function getJSON(path, extraHeaders){
+  if (S.transport === 'nkn'){
+    const req = { url: S.base.replace(/\/+$/, '')+path, method:'GET', headers: authHeaders(extraHeaders||{}), timeout_ms: 45000 };
+    const resp = await nknSendRelay(req, req.timeout_ms);
+    if (!resp || resp.ok===false) throw new Error((resp && resp.error) || ('HTTP '+(resp && resp.status)));
+    return resp.json ?? (resp.body_b64 ? JSON.parse(new TextDecoder('utf-8').decode(b64ToBytes(resp.body_b64))) : null);
+  }
+  const res = await fetch(S.base.replace(/\/+$/, '')+path, { headers: authHeaders(extraHeaders) });
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  return res.json();
+}
+async function headBlob(digest){
+  const url = S.base.replace(/\/+$/, '')+`/api/blobs/${encodeURIComponent(digest)}`;
+  if (S.transport === 'nkn'){
+    const req = { url, method:'HEAD', headers: authHeaders({'Content-Type':'application/octet-stream'}), timeout_ms: 20000 };
+    const resp = await nknSendRelay(req, req.timeout_ms);
+    if (!resp) throw new Error('no response');
+    return { status: resp.status, headers: resp.headers };
+  } else {
+    const res = await fetch(url, { method:'HEAD', headers: authHeaders({'Content-Type':'application/octet-stream'}) });
+    return { status: res.status, headers: Object.fromEntries(res.headers.entries()) };
+  }
+}
+async function postBlob(digest, file){
+  const url = S.base.replace(/\/+$/, '')+`/api/blobs/${encodeURIComponent(digest)}`;
+  if (S.transport === 'nkn'){
+    if (file.size > 4*1024*1024) throw new Error('File too large for NKN upload; switch to HTTP');
+    const buf = await file.arrayBuffer(); const body_b64 = bytesToB64(new Uint8Array(buf));
+    const req = { url, method:'POST', headers:{'Content-Type':'application/octet-stream'}, body_b64, timeout_ms: 300000 };
+    const resp = await nknSendRelay(req, req.timeout_ms);
+    if (!resp || resp.ok===false) throw new Error((resp && resp.error) || ('HTTP '+(resp && resp.status)));
+    return { status: resp.status, headers: resp.headers };
+  } else {
+    const res = await fetch(url, { method:'POST', headers: { 'Content-Type':'application/octet-stream', ...(S.apiKey ? (S.apiKey.startsWith('Bearer ') ? { 'Authorization': S.apiKey } : { 'X-API-Key': S.apiKey }) : {}) }, body: file });
+    return { status: res.status, headers: Object.fromEntries(res.headers.entries()) };
+  }
+}
+
+/* ===================== MODELS DROPDOWN ===================== */
+function splitModelName(name){
+  const i = name.lastIndexOf(':');
+  if (i === -1) return { base: name, tag:'latest', full: name };
+  return { base: name.slice(0,i), tag: name.slice(i+1)||'latest', full: name };
+}
+function naturalTagSort(a,b){
+  const ax=a.toLowerCase(), bx=b.toLowerCase();
+  if (ax==='latest' && bx!=='latest') return 1;
+  if (bx==='latest' && ax!=='latest') return -1;
+  const rex=/^(\d+(?:\.\d+)?)\s*([kmgbt]*)$/;
+  const pa=ax.match(rex), pb=bx.match(rex);
+  if (pa && pb){
+    const na=parseFloat(pa[1]), nb=parseFloat(pb[1]);
+    if (!Number.isNaN(na) && !Number.isNaN(nb)){
+      if (na!==nb) return na-nb;
+      return ax.localeCompare(bx);
+    }
+  }
+  const pba=ax.match(/^(\d+(?:\.\d+)?)b$/), pbb=bx.match(/^(\d+(?:\.\d+)?)b$/);
+  if (pba && pbb){
+    const na=parseFloat(pba[1]), nb=parseFloat(pbb[1]);
+    if (na!==nb) return na-nb;
+  }
+  return ax.localeCompare(bx);
+}
+async function refreshModels(){
+  if (S._modelsReqInFlight) return;
+  S._modelsReqInFlight = true;
+  S._modelsLastReq = Date.now();
+  S._modelsRequestsIssued++;
+
+  try{
+    const data = await getJSON('/api/tags');
+    const list = Array.isArray(data?.models) ? data.models : [];
+
+    const groups = new Map();
+    for (const m of list){
+      const nm = typeof m?.name === 'string' ? m.name : (typeof m?.model === 'string' ? m.model : null);
+      if (!nm) continue;
+      const { base, tag, full } = splitModelName(nm);
+      if (!groups.has(base)) groups.set(base, { tags: new Set(), byTag: new Map() });
+      const g = groups.get(base);
+      g.tags.add(tag);
+      g.byTag.set(tag, { full, tag, base, details: m?.details || {}, raw: m });
+    }
+
+    const sel = qs('chatModelSelect');
+    sel.innerHTML = '';
+    const bases = Array.from(groups.keys()).sort((a,b)=>a.localeCompare(b, undefined, { numeric:true }));
+    for (const base of bases){
+      const g = groups.get(base);
+      const tags = Array.from(g.tags).sort(naturalTagSort);
+      const og = document.createElement('optgroup');
+      og.label = base;
+      for (const tag of tags){
+        const mo = g.byTag.get(tag);
+        const opt = document.createElement('option');
+        opt.value = mo.full;
+        const sz = mo.details?.parameter_size ? ` · ${mo.details.parameter_size}` : '';
+        const ql = mo.details?.quantization_level ? ` · ${mo.details.quantization_level}` : '';
+        opt.textContent = `${tag}${sz}${ql}`;
+        og.appendChild(opt);
+      }
+      sel.appendChild(og);
+    }
+
+    S.models = bases.flatMap(base=>{
+      const g = groups.get(base);
+      return Array.from(g.tags).map(tag=>g.byTag.get(tag).full);
+    });
+
+    const want = S.chat.currentModel && S.models.includes(S.chat.currentModel)
+      ? S.chat.currentModel
+      : (S.models[0] || null);
+    S.chat.currentModel = want;
+    if (want) sel.value = want;
+
+    toast('Models loaded');
+
+    if (!S.models.length) ensureModelsLoadedWithRetry(5000);
+    else { clearTimeout(S._modelsRetryTimer); S._modelsRetryTimer = null; }
+
+    renderSessionListForModel();
+  } catch(e){
+    toast('Load models failed', false);
+    if (!S.models.length) ensureModelsLoadedWithRetry(5000);
+  } finally {
+    S._modelsReqInFlight = false;
+  }
+}
+
+/* ===================== CHAT PERSISTENCE ===================== */
+function loadChatStore(){ try{ const raw=localStorage.getItem(S.chat.key); const obj = raw?JSON.parse(raw):{}; S.chat.byModel = obj.byModel || {}; } catch{ S.chat.byModel = {}; } }
+function saveChatStore(){ const payload={ byModel: S.chat.byModel }; localStorage.setItem(S.chat.key, JSON.stringify(payload)); }
+function ensureModelBucket(model){ if (!S.chat.byModel[model]) S.chat.byModel[model] = { sessions: {}, lastUsedSid: null }; return S.chat.byModel[model]; }
+function newSession(model, name){
+  const bucket=ensureModelBucket(model);
+  const sid = model + '-' + Date.now().toString(36);
+  bucket.sessions[sid] = { name: name || 'Session ' + new Date().toLocaleString(), system:'', messages:[], updatedAt: Date.now() };
+  bucket.lastUsedSid = sid; saveChatStore(); return sid;
+}
+function renameSession(model, sid, name){ const b=ensureModelBucket(model); if (b.sessions[sid]){ b.sessions[sid].name = name || b.sessions[sid].name; b.sessions[sid].updatedAt = Date.now(); saveChatStore(); } }
+function deleteSession(model, sid){ const b=ensureModelBucket(model); delete b.sessions[sid]; if (b.lastUsedSid===sid) b.lastUsedSid = Object.keys(b.sessions)[0] || null; saveChatStore(); }
+function listSessions(model){ return Object.entries(ensureModelBucket(model).sessions).sort((a,b)=> (b[1].updatedAt||0) - (a[1].updatedAt||0)); }
+
+/* ===================== CHAT UI RENDER ===================== */
+function renderSessionListForModel(){
+  const model=S.chat.currentModel; if (!model) return;
+  const sel = qs('chatSessionSelect'); sel.innerHTML='';
+  const bucket = ensureModelBucket(model);
+  if (!bucket.lastUsedSid) bucket.lastUsedSid = newSession(model);
+  for (const [sid, sess] of listSessions(model)){
+    const o=document.createElement('option'); o.value=sid; o.textContent=sess.name; sel.appendChild(o);
+  }
+  sel.value = bucket.lastUsedSid;
+  S.chat.sid = bucket.lastUsedSid;
+  renderChatSession();
+}
+function renderChatSession(){
+  const model=S.chat.currentModel; const sid=S.chat.sid; if (!model || !sid) return;
+  const sess=ensureModelBucket(model).sessions[sid]; if (!sess) return;
+  qs('chatSystem').value = sess.system || '';
+  const list=qs('chatMsgList'); list.innerHTML='';
+  for (const m of sess.messages){
+    const d=document.createElement('div'); d.className='bubble ' + (m.role==='user'?'user':'assistant'); d.textContent = m.content || ''; list.appendChild(d);
+  }
+  list.scrollTop = list.scrollHeight;
+}
+function upsertAssistantInFlight(textChunk){
+  const list=qs('chatMsgList');
+  let last=list.lastElementChild;
+  if (!last || !last.classList.contains('assistant')){
+    last = document.createElement('div'); last.className='bubble assistant'; last.textContent=''; list.appendChild(last);
+  }
+  last.textContent += textChunk;
+  list.scrollTop = list.scrollHeight;
+}
+
+/* ===================== CHAT ACTIONS ===================== */
+function currentSession(){ const model=S.chat.currentModel; const sid=S.chat.sid; if(!model||!sid) return null; return ensureModelBucket(model).sessions[sid]; }
+function setSystemFromUI(){ const sess=currentSession(); if(!sess) return; sess.system = qs('chatSystem').value || ''; sess.updatedAt=Date.now(); saveChatStore(); }
+function pushUserMessage(txt){ const sess=currentSession(); if(!sess) return; sess.messages.push({ role:'user', content: txt }); sess.updatedAt=Date.now(); saveChatStore(); }
+function pushAssistantMessageFinal(txt){
+  const sess=currentSession(); if(!sess) return;
+  const last=sess.messages[sess.messages.length-1];
+  if (last && last.role==='assistant'){ last.content = (last.content||'') + txt; }
+  else sess.messages.push({ role:'assistant', content: txt });
+  sess.updatedAt=Date.now(); saveChatStore();
+}
+function startAssistantInFlight(){
+  const sess=currentSession(); if(!sess) return;
+  const last=sess.messages[sess.messages.length-1];
+  if (last && last.role==='assistant') return;
+  sess.messages.push({ role:'assistant', content:'' }); sess.updatedAt=Date.now(); saveChatStore();
+}
+function appendAssistantInFlight(txt){
+  const sess=currentSession(); if(!sess) return;
+  const last=sess.messages[sess.messages.length-1]; if (last && last.role==='assistant'){ last.content = (last.content||'') + txt; sess.updatedAt=Date.now(); saveChatStore(); }
+}
+function assembleAPIMessages(sess){
+  const arr=[];
+  if (sess.system && sess.system.trim()) arr.push({ role:'system', content: sess.system });
+  for (const m of sess.messages) arr.push({ role:m.role, content:m.content });
+  return arr;
+}
+
+/* ===================== STREAM PARSE ===================== */
+const EOT_TOKENS = ["<|eot_id|>", "</s>"];
+function stripEOT(s){
+  let out = s;
+  for (const tok of EOT_TOKENS){ if (!tok) continue; out = out.split(tok).join(''); }
+  return out;
+}
+function processNdjsonLine(line, kind){
+  try{
+    const obj = JSON.parse(line);
+    if (kind === 'chat'){
+      if (obj.message && typeof obj.message.content === 'string')
+        return { type:'delta', text: stripEOT(obj.message.content), done: !!obj.done };
+      if (typeof obj.response === 'string')
+        return { type:'delta', text: stripEOT(obj.response), done: !!obj.done };
+      return { type:'meta', obj };
+    } else {
+      if (typeof obj.response === 'string') return { type:'delta', text: stripEOT(obj.response), done: !!obj.done };
+      return { type:'meta', obj };
+    }
+  }catch{
+    return { type:'text', text: line };
+  }
+}
+
+/* ===================== CHAT SEND ===================== */
+async function chatSend(){
+  setSystemFromUI();
+  const model=S.chat.currentModel;
+  const stream = qs('chatStream').value === 'true';
+  const userText = qs('chatUserInput').value; if (!userText.trim()){ toast('Type a message', false); return; }
+  pushUserMessage(userText); qs('chatUserInput').value=''; renderChatSession();
+
+  const sess=currentSession(); if (!sess) return;
+  const payload={ model, messages: assembleAPIMessages(sess), stream };
+
+  // NKN streaming
+  if (S.transport==='nkn' && stream){
+    startAssistantInFlight();
+    const req = { url: S.base.replace(/\/+$/, '')+'/api/chat', method:'POST', headers: authHeaders({ 'X-Relay-Stream':'chunks' }), json: payload, timeout_ms: 180000 };
+    const handlers = {
+      onBegin: ()=>{},
+      onLine: (line, seq, ts)=>{
+        const ev=processNdjsonLine(line, 'chat');
+        if (ev.type==='delta' && ev.text){
+          appendAssistantInFlight(ev.text);
+          upsertAssistantInFlight(ev.text);
+        }
+      },
+      onEnd: ()=>{}
+    };
+    try{
+      await nknSendRelayStream(req, handlers, req.timeout_ms);
+      // Ensure UI reflects the final persisted assistant message (in case the last chunk arrived during grace window)
+      renderChatSession();
+      toast('Chat complete');
+    }catch(e){
+      upsertAssistantInFlight(`\n[error: ${e.message}]`); toast('Chat failed', false);
+    }
+    return;
+  }
+
+  // HTTP streaming
+  if (S.transport==='http' && stream){
+    startAssistantInFlight();
+    try{
+      const res = await fetch(S.base.replace(/\/+$/, '')+'/api/chat', { method:'POST', headers: authHeaders({'Content-Type':'application/json'}), body: JSON.stringify(payload) });
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      const reader = res.body.getReader(); const decoder = new TextDecoder('utf-8'); let leftover='';
+      while(true){
+        const { value, done } = await reader.read(); if (done) break;
+        const s = decoder.decode(value); const combined = leftover + s; const lines = combined.split(/\r?\n/); leftover = lines.pop() || '';
+        for (const ln of lines){
+          if (!ln.trim()) continue;
+          const ev = processNdjsonLine(ln, 'chat');
+          if (ev.type==='delta' && ev.text){ appendAssistantInFlight(ev.text); upsertAssistantInFlight(ev.text); }
+        }
+      }
+      if (leftover.trim()){
+        const ev = processNdjsonLine(leftover, 'chat');
+        if (ev.type==='delta' && ev.text){ appendAssistantInFlight(ev.text); upsertAssistantInFlight(ev.text); }
+      }
+      renderChatSession();
+      toast('Chat complete');
+    }catch(e){
+      upsertAssistantInFlight(`\n[error: ${e.message}]`); toast('Chat failed', false);
+    }
+    return;
+  }
+
+  // Non-stream
+  try{
+    const data = await callJSON('/api/chat', payload);
+    const text = (data?.message?.content) || (data?.response) || '';
+    pushAssistantMessageFinal(text); renderChatSession(); toast('Chat complete');
+  }catch(e){
+    upsertAssistantInFlight(`\n[error: ${e.message}]`); toast('Chat failed', false);
+  }
+}
+
+/* ===================== GENERATE ===================== */
+async function doGenerate(){
+  const model = qs('genModel').value.trim(); if (!model){ toast('Enter a model', false); return; }
+  const prompt = qs('genPrompt').value;
+  const stream = qs('genStream').value === 'true';
+  const fmt = parseMaybeJSON(qs('genFormat').value);
+  const opts = parseMaybeJSON(qs('genOptions').value);
+  const out = qs('genOut'); out.style.display='block'; out.textContent='';
+  const payload = { model, prompt, stream, ...(fmt!==undefined ? { format: fmt } : {}), ...(opts ? { options: opts } : {}) };
+
+  if (S.transport==='nkn' && stream){
+    const req = { url: S.base.replace(/\/+$/, '')+'/api/generate', method:'POST', headers: authHeaders({ 'X-Relay-Stream':'chunks' }), json: payload, timeout_ms: 180000 };
+    const handlers = {
+      onBegin: ()=>{ out.textContent=''; },
+      onLine: (line)=>{ const ev=processNdjsonLine(line, 'generate'); if (ev.type==='delta' && ev.text){ out.textContent += ev.text; out.scrollTop = out.scrollHeight; } },
+      onEnd: ()=>{}
+    };
+    try { await nknSendRelayStream(req, handlers, req.timeout_ms); toast('Generate complete'); }
+    catch(e){ out.textContent += '\nError: ' + e.message; toast('Generate failed', false); }
+  } else if (S.transport==='http' && stream){
+    try{
+      const res = await fetch(S.base.replace(/\/+$/, '')+'/api/generate', { method:'POST', headers: authHeaders({'Content-Type':'application/json'}), body: JSON.stringify(payload) });
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      const reader=res.body.getReader(); const decoder=new TextDecoder('utf-8'); let leftover='';
+      while(true){
+        const { value, done } = await reader.read(); if (done) break;
+        const s=decoder.decode(value); const combined=leftover+s; const lines=combined.split(/\r?\n/); leftover = lines.pop() || '';
+        for (const ln of lines){ if (!ln.trim()) continue; const ev=processNdjsonLine(ln,'generate'); if (ev.type==='delta' && ev.text){ out.textContent += ev.text; out.scrollTop = out.scrollHeight; } }
+      }
+      if (leftover){ const ev=processNdjsonLine(leftover,'generate'); if (ev.type==='delta' && ev.text) out.textContent += ev.text; }
+      toast('Generate complete');
+    }catch(e){ out.textContent += '\nError: ' + e.message; toast('Generate failed', false); }
+  } else {
+    try { out.textContent = j(await callJSON('/api/generate', payload)); toast('Generate complete'); }
+    catch(e){ out.textContent = 'Error: ' + e.message; toast('Generate failed', false); }
+  }
+}
+
+/* ===================== INSPECT ===================== */
+async function listModels(){ const box=qs('inspectBox'); box.style.display='block'; try{ box.textContent = j(await getJSON('/api/tags')); toast('Loaded models'); }catch(e){ box.textContent='Error: '+e.message; toast('Models error', false); } }
+async function listPS(){ const box=qs('inspectBox'); box.style.display='block'; try{ box.textContent = j(await getJSON('/api/ps')); toast('Loaded running models'); }catch(e){ box.textContent='Error: '+e.message; toast('PS error', false); } }
+async function getVersion(){ const box=qs('inspectBox'); box.style.display='block'; try{ box.textContent = j(await getJSON('/api/version')); toast('Got version'); }catch(e){ box.textContent='Error: '+e.message; toast('Version error', false); } }
+
+/* ===================== ADMIN ===================== */
+async function createFromModel(){
+  const model = qs('createModelName').value.trim(); if (!model){ toast('Enter new model name', false); return; }
+  const from = prompt('From base model (e.g. llama3.2 or llama3.1:8b-instruct-fp16)?', 'llama3.2') || '';
+  const system = qs('createSystem').value || undefined;
+  const template = qs('createTemplate').value || undefined;
+  const parameters = parseMaybeJSON(qs('createParams').value);
+  const messages = parseMaybeJSON(qs('createMessages').value);
+  const body = { model, ...(from?{from}:{}) , ...(system?{system}:{}) , ...(template?{template}:{}) , ...(parameters?{parameters}:{}) , ...(Array.isArray(messages)?{messages}:{}) , stream:true };
+  const box=qs('adminOut'); box.style.display='block'; box.textContent='(creating…)\n';
+
+  if (S.transport==='nkn'){
+    const req = { url: S.base.replace(/\/+$/, '')+'/api/create', method:'POST', headers: authHeaders({ 'X-Relay-Stream':'chunks' }), json: body, timeout_ms: 20*60*1000 };
+    const h = { onBegin: ()=>{}, onLine: (line)=>{ box.textContent += '\n' + line; box.scrollTop = box.scrollHeight; }, onEnd: ()=>{} };
+    try { await nknSendRelayStream(req, h, req.timeout_ms); toast('Create finished'); refreshModels(); }
+    catch(e){ box.textContent += '\nError: ' + e.message; toast('Create failed', false); }
+  } else {
+    try{
+      const res = await fetch(S.base.replace(/\/+$/, '')+'/api/create', { method:'POST', headers: authHeaders({'Content-Type':'application/json'}), body: JSON.stringify(body) });
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      const reader=res.body.getReader(); const decoder=new TextDecoder('utf-8'); let leftover='';
+      while(true){
+        const { value, done } = await reader.read(); if (done) break;
+        const s=decoder.decode(value); const combined=leftover+s; const lines=combined.split(/\r?\n/); leftover = lines.pop() || '';
+        for (const ln of lines){ if (!ln.trim()) continue; box.textContent += '\n' + ln; box.scrollTop = box.scrollHeight; }
+      }
+      if (leftover) box.textContent += '\n' + leftover;
+      toast('Create finished'); refreshModels();
+    }catch(e){ box.textContent += '\nError: ' + e.message; toast('Create failed', false); }
+  }
+}
+async function showModel(){
+  const model = qs('showModel').value.trim(); if (!model){ toast('Enter model', false); return; }
+  const verbose = qs('showVerbose').value === 'true';
+  const box=qs('adminOut'); box.style.display='block';
+  try{ box.textContent = j(await callJSON('/api/show', { model, ...(verbose?{verbose:true}:{}) })); toast('Show ok'); }
+  catch(e){ box.textContent='Error: '+e.message; toast('Show error', false); }
+}
+async function copyModel(){
+  const src=qs('copySrc').value.trim(), dst=qs('copyDst').value.trim(); if (!src || !dst){ toast('Enter source & destination', false); return; }
+  const box=qs('adminOut'); box.style.display='block';
+  try{ box.textContent = j(await callJSON('/api/copy', { source: src, destination: dst })); toast('Copy ok'); refreshModels(); }
+  catch(e){ box.textContent='Error: '+e.message; toast('Copy error', false); }
+}
+async function deleteModel(){
+  const model = qs('deleteModel').value.trim(); if (!model){ toast('Enter model to delete', false); return; }
+  const box=qs('adminOut'); box.style.display='block';
+  try{ box.textContent = j(await callJSON('/api/delete', { model }, undefined, 'DELETE')); toast('Delete ok'); refreshModels(); }
+  catch(e){ box.textContent='Error: '+e.message; toast('Delete error', false); }
+}
+
+/* ===================== PULL / PUSH / EMBEDDINGS / BLOBS ===================== */
+async function pullModel(){
+  const name = qs('pullModelName').value.trim(); if (!name){ toast('Enter a model', false); return; }
+  const body={ model:name, stream:true };
+  const box=qs('pullPushOut'); box.style.display='block'; box.textContent='(pulling…)\n';
+
+  if (S.transport==='nkn'){
+    const req = { url: S.base.replace(/\/+$/, '')+'/api/pull', method:'POST', headers: authHeaders({ 'X-Relay-Stream':'chunks' }), json: body, timeout_ms: 60*60*1000 };
+    const h = { onBegin: ()=>{}, onLine: (line)=>{ box.textContent+='\n'+line; box.scrollTop=box.scrollHeight; }, onEnd: ()=>{} };
+    try { await nknSendRelayStream(req, h, req.timeout_ms); toast('Pull finished'); refreshModels(); }
+    catch(e){ box.textContent += '\nError: ' + e.message; toast('Pull failed', false); }
+  } else {
+    try{
+      const res = await fetch(S.base.replace(/\/+$/, '')+'/api/pull', { method:'POST', headers: authHeaders({'Content-Type':'application/json'}), body: JSON.stringify(body) });
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      const reader=res.body.getReader(); const decoder=new TextDecoder('utf-8'); let leftover='';
+      while(true){
+        const { value, done } = await reader.read(); if (done) break;
+        const s=decoder.decode(value); const combined=leftover+s; const lines=combined.split(/\r?\n/); leftover = lines.pop() || '';
+        for (const ln of lines){ if (!ln.trim()) continue; box.textContent+='\n'+ln; box.scrollTop=box.scrollHeight; }
+      }
+      if (leftover) box.textContent+='\n'+leftover;
+      toast('Pull finished'); refreshModels();
+    }catch(e){ box.textContent += '\nError: ' + e.message; toast('Pull failed', false); }
+  }
+}
+async function pushModel(){
+  const name = qs('pushModelName').value.trim(); if (!name){ toast('Enter namespace/model:tag', false); return; }
+  const body={ model:name, stream:true };
+  const box=qs('pullPushOut'); box.style.display='block'; box.textContent='(pushing…)\n';
+
+  if (S.transport==='nkn'){
+    const req = { url: S.base.replace(/\/+$/, '')+'/api/push', method:'POST', headers: authHeaders({ 'X-Relay-Stream':'chunks' }), json: body, timeout_ms: 60*60*1000 };
+    const h = { onBegin: ()=>{}, onLine: (line)=>{ box.textContent+='\n'+line; box.scrollTop=box.scrollHeight; }, onEnd: ()=>{} };
+    try { await nknSendRelayStream(req, h, req.timeout_ms); toast('Push finished'); refreshModels(); }
+    catch(e){ box.textContent += '\nError: ' + e.message; toast('Push failed', false); }
+  } else {
+    try{
+      const res = await fetch(S.base.replace(/\/+$/, '')+'/api/push', { method:'POST', headers: authHeaders({'Content-Type':'application/json'}), body: JSON.stringify(body) });
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      const reader=res.body.getReader(); const decoder=new TextDecoder('utf-8'); let leftover='';
+      while(true){
+        const { value, done } = await reader.read(); if (done) break;
+        const s=decoder.decode(value); const combined=leftover+s; const lines=combined.split(/\r?\n/); leftover = lines.pop() || '';
+        for (const ln of lines){ if (!ln.trim()) continue; box.textContent+='\n'+ln; box.scrollTop=box.scrollHeight; }
+      }
+      if (leftover) box.textContent+='\n'+leftover;
+      toast('Push finished'); refreshModels();
+    }catch(e){ box.textContent += '\nError: ' + e.message; toast('Push failed', false); }
+  }
+}
+async function doEmbeddings(){
+  const model = qs('embModel').value.trim(); if (!model){ toast('Enter an embedding model', false); return; }
+  const endpoint = qs('embEndpoint').value;
+  const input = parseMaybeJSON(qs('embInput').value) ?? '';
+  const options = parseMaybeJSON(qs('embOptions').value);
+  const keep_alive = qs('embKeepAlive').value.trim();
+  const out=qs('embOut'); out.style.display='block'; out.textContent='(requesting)…';
+  try{
+    if (endpoint==='embed'){
+      const body={ model, input, ...(options?{options}:{}) , ...(keep_alive?{keep_alive}:{}) };
+      out.textContent = j(await callJSON('/api/embed', body));
+    } else {
+      const body={ model, prompt: (typeof input==='string' ? input : JSON.stringify(input)), ...(options?{options}:{}) , ...(keep_alive?{keep_alive}:{}) };
+      out.textContent = j(await callJSON('/api/embeddings', body));
+    }
+    toast('Embeddings complete');
+  }catch(e){ out.textContent = 'Error: ' + e.message; toast('Embeddings failed', false); }
+}
+async function sha256Hex(file){
+  const buf=await file.arrayBuffer(); const hash=await crypto.subtle.digest('SHA-256', buf);
+  const arr=Array.from(new Uint8Array(hash)); return 'sha256:'+arr.map(b=>b.toString(16).padStart(2,'0')).join('');
+}
+async function blobHead(){
+  const d=qs('blobDigest').value.trim(); if (!d){ toast('Enter digest', false); return; }
+  const box=qs('blobOut'); box.style.display='block';
+  try{ const r=await headBlob(d); box.textContent = `HEAD ${d} → ${r.status}\n`+j(r.headers); toast(r.status===200?'Blob exists':'Not found', r.status===200); }
+  catch(e){ box.textContent = 'Error: ' + e.message; toast('HEAD error', false); }
+}
+async function blobPush(){
+  const input=qs('blobFile'); const file=input.files && input.files[0]; if (!file){ toast('Choose a file', false); return; }
+  const box=qs('blobOut'); box.style.display='block'; box.textContent='(hashing file…)\n';
+  let digest=qs('blobDigest').value.trim();
+  if (!digest){ digest=await sha256Hex(file); qs('blobDigest').value=digest; box.textContent += `Computed digest: ${digest}\n`; }
+  try{
+    if (S.transport==='nkn' && file.size > 4*1024*1024){ throw new Error('File too large for NKN upload; switch transport to HTTP'); }
+    const r=await postBlob(digest, file);
+    box.textContent += `POST ${digest} → ${r.status}\n`+j(r.headers);
+    toast(r.status===201?'Uploaded':'Done');
+  }catch(e){ box.textContent += 'Error: ' + e.message; toast('Upload error', false); }
+}
+
+/* ===================== EVENTS ===================== */
+function reflectInputs(){
+  qs('transport').value=S.transport; qs('baseUrl').value=S.base; qs('relayAddr').value=S.relayAddr; qs('apiKey').value=S.apiKey;
+}
+function saveSettings(){
+  S.transport = qs('transport').value;
+  S.base = qs('baseUrl').value.trim() || S.base;
+  S.relayAddr = qs('relayAddr').value.trim();
+  S.apiKey = qs('apiKey').value.trim();
+  localStorage.setItem('ollama.transport', S.transport);
+  localStorage.setItem('ollama.base', S.base);
+  localStorage.setItem('ollama.relayAddr', S.relayAddr);
+  localStorage.setItem('ollama.apiKey', S.apiKey);
+  toast('Saved settings'); reflectTransportUI();
+  if (S.transport==='nkn') nknEnsureClient();
+  refreshModels();
+  ensureModelsLoadedWithRetry(5000);
+}
+function bindEvents(){
+  qs('transport').addEventListener('change', saveSettings);
+  qs('nknConnectBtn').addEventListener('click', ()=>nknEnsureClient());
+  qs('nknDisconnectBtn').addEventListener('click', ()=>{ try{ S.nkn.client && S.nkn.client.close(); }catch{} S.nkn.client=null; S.nkn.ready=false; reflectTransportUI(); });
+  qs('saveBtn').addEventListener('click', saveSettings);
+
+  // Inspect
+  qs('listModels').addEventListener('click', listModels);
+  qs('listPS').addEventListener('click', listPS);
+  qs('getVersion').addEventListener('click', getVersion);
+
+  // Generate
+  qs('genGo').addEventListener('click', doGenerate);
+
+  // Chat & sessions
+  qs('chatModelSelect').addEventListener('change', (e)=>{ S.chat.currentModel=e.target.value; renderSessionListForModel(); saveChatStore(); });
+  qs('chatSessionSelect').addEventListener('change', (e)=>{ ensureModelBucket(S.chat.currentModel).lastUsedSid=e.target.value; S.chat.sid=e.target.value; saveChatStore(); renderChatSession(); });
+  qs('chatNewSession').addEventListener('click', ()=>{ const sid=newSession(S.chat.currentModel); renderSessionListForModel(); });
+  qs('chatRenameSession').addEventListener('click', ()=>{ const name=prompt('Session name?', currentSession()?.name || '') || ''; if (name){ renameSession(S.chat.currentModel, S.chat.sid, name); renderSessionListForModel(); } });
+  qs('chatDeleteSession').addEventListener('click', ()=>{ if (confirm('Delete this session?')){ deleteSession(S.chat.currentModel, S.chat.sid); renderSessionListForModel(); } });
+  qs('chatSystem').addEventListener('change', setSystemFromUI);
+  qs('chatSend').addEventListener('click', chatSend);
+  qs('chatUserInput').addEventListener('keydown', (e)=>{ if (e.key==='Enter' && (e.ctrlKey||e.metaKey)){ e.preventDefault(); chatSend(); } });
+
+  // Upload/Download messages JSON
+  qs('chatDownload').addEventListener('click', ()=>{ const sess=currentSession(); if (!sess) return; downloadJSON((sess.name||'session')+'.json', sess.messages); });
+  qs('chatUpload').addEventListener('change', async (e)=>{
+    const file=e.target.files && e.target.files[0]; if (!file) return;
+    try{
+      const txt=await file.text(); const arr=JSON.parse(txt);
+      if (!Array.isArray(arr)) throw new Error('JSON must be an array of messages');
+      const sess=currentSession(); if (!sess) return;
+      sess.messages = arr; sess.updatedAt=Date.now(); saveChatStore(); renderChatSession(); toast('Messages loaded');
+    }catch(err){ toast('Upload failed: '+err.message, false); }
+    e.target.value='';
+  });
+
+  // Admin
+  qs('createFromModel').addEventListener('click', createFromModel);
+  qs('showBtn').addEventListener('click', showModel);
+  qs('copyBtn').addEventListener('click', copyModel);
+  qs('deleteBtn').addEventListener('click', deleteModel);
+
+  // Pull / Push
+  qs('pullModel').addEventListener('click', pullModel);
+  qs('pushModel').addEventListener('click', pushModel);
+
+  // Embeddings
+  qs('embGo').addEventListener('click', doEmbeddings);
+
+  // Blobs
+  qs('blobHead').addEventListener('click', blobHead);
+  qs('blobPush').addEventListener('click', blobPush);
+}
+
+/* ===================== INIT ===================== */
+function init(){
+  loadChatStore();
+  reflectInputs(); reflectTransportUI(); bindEvents();
+  if (S.transport==='nkn') nknEnsureClient();
+  document.getElementById('status').innerHTML = `<span class="dot ok"></span><span>Ready</span>`;
+  refreshModels();
+  ensureModelsLoadedWithRetry(5000);
+}
+document.addEventListener('DOMContentLoaded', init);
+</script>
+</body>
+</html>
