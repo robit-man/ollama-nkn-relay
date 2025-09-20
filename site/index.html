@@ -297,22 +297,64 @@
 </main>
 
 <script>
+/* =====================================================================
+   OLLAMA FRONTEND (RESILIENT)
+   - Auto-heals NKN client (restarts with backoff on close/error)
+   - Relay heartbeat (NKN ping + HTTP ping) with UI status
+   - Background models poller with adaptive (backoff) retry
+   - Async model discovery runs forever; no overlap; safe on tab hide/show
+   ===================================================================== */
+
 /* ===================== STATE ===================== */
-const STREAM_GRACE_MS = 240; // grace window to accept late line batches after end
+const STREAM_GRACE_MS = 240;      // accept late line batches after "end"
+const MODELS_BASE_POLL_MS = 15000;// background poll on success
+const MODELS_MAX_BACKOFF_MS = 60000;
+const NKN_PING_EVERY_MS = 12000;  // ask relay for info/pong
+const NKN_STALE_AFTER_MS = 30000; // if no pong/info seen in this window -> reconnect
+const HTTP_PING_EVERY_MS = 20000; // ping /api/version for base health
+const VISIBILITY_DEBOUNCE_MS = 1000;
+
 const S = {
+  // persisted
   transport: localStorage.getItem('ollama.transport') || 'http',
-  base: localStorage.getItem('ollama.base') || 'http://127.0.0.1:11434',
+  base:      localStorage.getItem('ollama.base') || 'http://127.0.0.1:11434',
   relayAddr: localStorage.getItem('ollama.relayAddr') || '',
-  apiKey: localStorage.getItem('ollama.apiKey') || '',
+  apiKey:    localStorage.getItem('ollama.apiKey') || '',
+
+  // models
   models: [],
   _modelsReqInFlight: false,
   _modelsLastReq: 0,
-  _modelsRetryTimer: null,
   _modelsRequestsIssued: 0,
-  nkn: { client: null, addr: '', ready: false, pending: new Map(), streams: new Map(), nextId: 1, readyCbs: [] },
+  _modelsRetryTimer: null,
+  _modelsFailCount: 0, // for backoff
+  _modelsPollTimer: null,
+
+  // health (http)
+  http: { healthy: null, lastSeen: 0, pingTimer: null },
+
+  // nkn subsystem
+  nkn: {
+    client: null,
+    addr: '',
+    ready: false,
+    pending: new Map(),     // id -> {resolve,reject,timer}
+    streams: new Map(),     // id -> ctx
+    nextId: 1,
+    readyCbs: [],
+    // resilience
+    restarting: false,
+    backoffMs: 500,         // exp backoff
+    maxBackoffMs: 15000,
+    restartTimer: null,
+    pingTimer: null,
+    lastSeen: 0,            // time of last relay.info / relay.pong we saw
+  },
+
+  // chat store
   chat: {
     key: 'ollama.chat.v1',
-    byModel: {},          // { [model]: { sessions: { [sid]: {name, system, messages: [...], updatedAt} }, lastUsedSid } }
+    byModel: {},
     currentModel: null,
     sid: null
   }
@@ -320,41 +362,164 @@ const S = {
 
 /* ===================== HELPERS ===================== */
 function qs(id){ return document.getElementById(id) }
-function log(s){ const el = qs('statusBox'); el.textContent += `\n${s}`; el.scrollTop = el.scrollHeight; }
 function j(x){ try{ return JSON.stringify(x, null, 2) } catch{ return String(x) } }
 function parseMaybeJSON(txt){ const t=(txt||'').trim(); if(!t) return undefined; try{ return JSON.parse(t); } catch{ return t; } }
 function downloadJSON(filename, obj){ const blob = new Blob([JSON.stringify(obj, null, 2)],{type:'application/json'}); const url = URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download=filename; a.click(); setTimeout(()=>URL.revokeObjectURL(url),500); }
 function b64ToBytes(b64){ const bin=atob(b64); const len=bin.length; const out=new Uint8Array(len); for(let i=0;i<len;i++) out[i]=bin.charCodeAt(i); return out; }
 function bytesToB64(arr){ let bin=''; const bytes=new Uint8Array(arr); for(let i=0;i<bytes.length;i++) bin+=String.fromCharCode(bytes[i]); return btoa(bin); }
-function reflectTransportUI(){ qs('nknInfo').textContent = (S.transport==='nkn' ? (S.nkn.ready ? `connected • ${S.nkn.addr.slice(0,10)}…` : 'connecting…') : 'disabled'); }
-function authHeaders(h={}){ const headers=Object.assign({}, h); if(!headers['Content-Type']) headers['Content-Type']='application/json'; if(S.apiKey){ if(S.apiKey.startsWith('Bearer ')) headers['Authorization']=S.apiKey; else headers['X-API-Key']=S.apiKey; } return headers; }
-function toast(txt, ok=true){ const st=qs('status'); st.innerHTML = `<span class="dot ${ok?'ok':'err'}"></span><span>${txt}</span>`; setTimeout(()=>{ st.innerHTML = `<span class="dot ok"></span><span>Ready</span>`; }, 1400); }
-function ensureModelsLoadedWithRetry(delayMs=5000){
-  const issuedAt = S._modelsRequestsIssued;
-  clearTimeout(S._modelsRetryTimer);
-  S._modelsRetryTimer = setTimeout(()=>{
-    if (S._modelsRequestsIssued === issuedAt &&
-        (!Array.isArray(S.models) || S.models.length===0) &&
-        !S._modelsReqInFlight){
-      refreshModels();
-    }
-  }, delayMs);
+function now(){ return Date.now() }
+function clamp(n,min,max){ return Math.max(min, Math.min(max, n)) }
+function nextBackoff(cur, cap){ return clamp(cur*2, 500, cap) }
+function logStatus(txt, ok=true){ const st=qs('status'); if(!st) return; st.innerHTML = `<span class="dot ${ok?'ok':'err'}"></span><span>${txt}</span>`; }
+function toast(txt, ok=true){
+  logStatus(txt, ok);
+  setTimeout(()=>{ logStatus('Ready', true) }, 1400);
+}
+function authHeaders(h={}){
+  const headers=Object.assign({}, h);
+  if(!headers['Content-Type']) headers['Content-Type']='application/json';
+  if(S.apiKey){
+    if(S.apiKey.startsWith('Bearer ')) headers['Authorization']=S.apiKey;
+    else headers['X-API-Key']=S.apiKey;
+  }
+  return headers;
 }
 
-/* ===================== NKN LAYER ===================== */
-function nknEnsureClient(){
-  if (S.nkn.client) return;
-  if (!window.nkn || !(window.nkn.MultiClient || window.nkn.Client)){ toast('nkn-sdk not loaded', false); return; }
-  const client = new nkn.MultiClient({ identifier: 'webui', numSubClients: 4 });
-  S.nkn.client = client;
+/* ===================== MODELS REFRESH (RETRY + POLLER) ===================== */
+function _scheduleModelsRetry(ms){
+  clearTimeout(S._modelsRetryTimer);
+  S._modelsRetryTimer = setTimeout(()=>{ refreshModels() }, ms);
+}
+function _startModelsPoller(){
+  clearTimeout(S._modelsPollTimer);
+  const baseDelay = MODELS_BASE_POLL_MS;
+  S._modelsPollTimer = setInterval(()=>{
+    // Don't pile up; only poll if idle and tab visible
+    if (S._modelsReqInFlight) return;
+    if (document.hidden) return;
+    refreshModels(/*silent=*/true);
+  }, baseDelay);
+}
+async function refreshModels(silent=false){
+  if (S._modelsReqInFlight) return;
+  S._modelsReqInFlight = true;
+  S._modelsLastReq = now();
+  S._modelsRequestsIssued++;
 
+  try{
+    const data = await getJSON('/api/tags');
+    const list = Array.isArray(data?.models) ? data.models : [];
+
+    const groups = new Map();
+    for (const m of list){
+      const nm = typeof m?.name === 'string' ? m.name : (typeof m?.model === 'string' ? m.model : null);
+      if (!nm) continue;
+      const { base, tag, full } = splitModelName(nm);
+      if (!groups.has(base)) groups.set(base, { tags: new Set(), byTag: new Map() });
+      const g = groups.get(base);
+      g.tags.add(tag);
+      g.byTag.set(tag, { full, tag, base, details: m?.details || {}, raw: m });
+    }
+
+    const sel = qs('chatModelSelect');
+    if (sel){
+      sel.innerHTML = '';
+      const bases = Array.from(groups.keys()).sort((a,b)=>a.localeCompare(b, undefined, { numeric:true }));
+      for (const base of bases){
+        const g = groups.get(base);
+        const tags = Array.from(g.tags).sort(naturalTagSort);
+        const og = document.createElement('optgroup');
+        og.label = base;
+        for (const tag of tags){
+          const mo = g.byTag.get(tag);
+          const opt = document.createElement('option');
+          opt.value = mo.full;
+          const sz = mo.details?.parameter_size ? ` · ${mo.details.parameter_size}` : '';
+          const ql = mo.details?.quantization_level ? ` · ${mo.details.quantization_level}` : '';
+          opt.textContent = `${tag}${sz}${ql}`;
+          og.appendChild(opt);
+        }
+        sel.appendChild(og);
+      }
+      S.models = Array.from(groups.keys()).flatMap(base=>{
+        const g = groups.get(base);
+        return Array.from(g.tags).map(tag=>g.byTag.get(tag).full);
+      });
+
+      // choose current model
+      const want = S.chat.currentModel && S.models.includes(S.chat.currentModel)
+        ? S.chat.currentModel
+        : (S.models[0] || null);
+      S.chat.currentModel = want;
+      if (want) sel.value = want;
+      renderSessionListForModel();
+    }
+
+    S._modelsFailCount = 0;
+    if (!silent) toast('Models loaded');
+    // keep polling in background; no special reschedule needed (interval handles it)
+  } catch(e){
+    S._modelsFailCount++;
+    const backoff = clamp(500 * (2 ** (S._modelsFailCount-1)), 1000, MODELS_MAX_BACKOFF_MS);
+    if (!silent) toast('Load models failed; retrying…', false);
+    _scheduleModelsRetry(backoff);
+  } finally {
+    S._modelsReqInFlight = false;
+  }
+}
+function splitModelName(name){
+  const i = name.lastIndexOf(':');
+  if (i === -1) return { base: name, tag:'latest', full: name };
+  return { base: name.slice(0,i), tag: name.slice(i+1)||'latest', full: name };
+}
+function naturalTagSort(a,b){
+  const ax=a.toLowerCase(), bx=b.toLowerCase();
+  if (ax==='latest' && bx!=='latest') return 1;
+  if (bx==='latest' && ax!=='latest') return -1;
+  const rex=/^(\d+(?:\.\d+)?)\s*([kmgbt]*)$/;
+  const pa=ax.match(rex), pb=bx.match(rex);
+  if (pa && pb){
+    const na=parseFloat(pa[1]), nb=parseFloat(pb[1]);
+    if (!Number.isNaN(na) && !Number.isNaN(nb)){
+      if (na!==nb) return na-nb;
+      return ax.localeCompare(bx);
+    }
+  }
+  const pba=ax.match(/^(\d+(?:\.\d+)?)b$/), pbb=bx.match(/^(\d+(?:\.\d+)?)b$/);
+  if (pba && pbb){
+    const na=parseFloat(pba[1]), nb=parseFloat(pbb[1]);
+    if (na!==nb) return na-nb;
+  }
+  return ax.localeCompare(bx);
+}
+
+/* ===================== TRANSPORT HEALTH ===================== */
+function reflectTransportUI(){
+  const el = qs('nknInfo');
+  if (!el) return;
+  if (S.transport !== 'nkn'){ el.textContent = 'disabled'; return; }
+  if (S.nkn.ready){
+    const since = Math.max(0, now()-S.nkn.lastSeen);
+    el.textContent = `connected • ${S.nkn.addr.slice(0,10)}…${since>15000?' (stale)': ''}`;
+  } else {
+    el.textContent = S.nkn.restarting ? `retrying in ${(S.nkn.backoffMs/1000).toFixed(1)}s…` : 'connecting…';
+  }
+}
+
+/* ===================== NKN LAYER (RESILIENT) ===================== */
+function _bindNknHandlers(client){
   client.on('connect', ()=>{
     S.nkn.addr = client.addr || '';
     S.nkn.ready = true;
+    S.nkn.restarting = false;
+    S.nkn.backoffMs = 500;
+    S.nkn.lastSeen = now();
     (S.nkn.readyCbs||[]).forEach(fn=>{ try{ fn() }catch{} });
     S.nkn.readyCbs.length = 0;
     reflectTransportUI(); toast('NKN connected');
-    refreshModels(); ensureModelsLoadedWithRetry(5000);
+
+    // kick model poll immediately on first connect
+    refreshModels(true);
   });
 
   client.on('message', (a,b)=>{
@@ -364,7 +529,14 @@ function nknEnsureClient(){
       const msg = JSON.parse(txt);
       const ev = msg.event || ''; const id = msg.id;
 
-      // Streamed batches (ordered with seq)
+      // relay keepalive responses
+      if (ev === 'relay.info' || ev === 'relay.pong'){
+        S.nkn.lastSeen = now();
+        reflectTransportUI();
+        return;
+      }
+
+      // Streamed batches
       if (ev === 'relay.response.lines' && id){
         const ctx = S.nkn.streams.get(id); if (!ctx) return;
         const arr = Array.isArray(msg.lines) ? msg.lines : [];
@@ -374,8 +546,6 @@ function nknEnsureClient(){
           ctx.maxSeq = Math.max(ctx.maxSeq, seq);
         }
         _drainOrderedLines(ctx);
-
-        // If we've already seen end, rearm a short finalize window to let stragglers arrive.
         if (ctx.ended) _scheduleFinalize(ctx, 'late-lines');
         return;
       }
@@ -387,13 +557,12 @@ function nknEnsureClient(){
       }
 
       if (ev === 'relay.response.keepalive' && id){
-        const ctx = S.nkn.streams.get(id); if (ctx) ctx.lastHeartbeat = Date.now();
+        const ctx = S.nkn.streams.get(id); if (ctx) ctx.lastHeartbeat = now();
         return;
       }
 
       if (ev === 'relay.response.end' && id){
         const ctx = S.nkn.streams.get(id); if (!ctx) return;
-        // Mark ended, then allow a final grace window for any in-flight lines to land, using seq to keep order.
         ctx.ended = true;
         _scheduleFinalize(ctx, 'end');
         return;
@@ -403,12 +572,48 @@ function nknEnsureClient(){
       if (ev === 'relay.response' && id){
         const p = S.nkn.pending.get(id); if (p){ clearTimeout(p.timer); S.nkn.pending.delete(id); p.resolve(msg); }
       }
-
-    }catch(e){ /* ignore */ }
+    }catch{ /* ignore */ }
   });
 
-  client.on('close', ()=>{ S.nkn.ready = false; reflectTransportUI(); });
+  const onCloseOrError = ()=>{
+    S.nkn.ready = false;
+    reflectTransportUI();
+    // ensure we try reconnect with backoff
+    nknScheduleRestart();
+  };
+  client.on('close', onCloseOrError);
+  client.on('error', onCloseOrError);
 }
+
+function nknEnsureClient(){
+  if (S.nkn.client) return;
+  if (!window.nkn || !(window.nkn.MultiClient || window.nkn.Client)){
+    toast('nkn-sdk not loaded', false);
+    return;
+  }
+  const client = new window.nkn.MultiClient({ identifier: 'webui', numSubClients: 4 });
+  S.nkn.client = client;
+  _bindNknHandlers(client);
+
+  // start pingers
+  startNknPingLoop();
+}
+
+function nknScheduleRestart(){
+  // if client exists, let it attempt auto-reconnect; but also supervise
+  if (S.nkn.restartTimer) return;
+  S.nkn.restarting = true;
+  const wait = S.nkn.backoffMs = nextBackoff(S.nkn.backoffMs, S.nkn.maxBackoffMs);
+  reflectTransportUI();
+  S.nkn.restartTimer = setTimeout(()=>{
+    S.nkn.restartTimer = null;
+    // Hard re-init if not ready yet (fresh client)
+    try{ if (S.nkn.client && S.nkn.client.close) S.nkn.client.close() }catch{}
+    S.nkn.client = null;
+    nknEnsureClient();
+  }, wait);
+}
+
 function nknWaitReady(timeoutMs=20000){
   return new Promise((resolve, reject)=>{
     if (S.nkn.ready) return resolve();
@@ -419,11 +624,38 @@ function nknWaitReady(timeoutMs=20000){
     (S.nkn.readyCbs = S.nkn.readyCbs||[]).push(onReady);
   });
 }
+
+function startNknPingLoop(){
+  clearInterval(S.nkn.pingTimer);
+  S.nkn.pingTimer = setInterval(async ()=>{
+    if (S.transport !== 'nkn') return;
+    if (!S.relayAddr) return;
+    // If we've gone stale, force restart path
+    if (S.nkn.ready && (now() - S.nkn.lastSeen) > NKN_STALE_AFTER_MS){
+      // send a ping, and also schedule restart so we heal even if ping can't be sent
+      try{ await nknSendDM({event:'relay.info'}); }catch{}
+      nknScheduleRestart();
+      return;
+    }
+    // routine ping when connected
+    if (S.nkn.ready){
+      try{ await nknSendDM({event:'relay.info'}); }catch{/* ignore */ }
+    }
+  }, NKN_PING_EVERY_MS);
+}
+
+async function nknSendDM(body){
+  if (!S.relayAddr) throw new Error('No relay address set');
+  await nknWaitReady();
+  const client = S.nkn.client;
+  return client.send(S.relayAddr, JSON.stringify(body), { noReply: false, maxHoldingSeconds: 60 }).catch(()=>{ /* ignore */});
+}
+
 async function nknSendRelayStream(reqSpec, handlers={}, timeoutMs=180000){
   if (!S.relayAddr) throw new Error('No relay address set');
   await nknWaitReady();
   const client = S.nkn.client;
-  const id = 'web-' + Date.now() + '-' + (S.nkn.nextId++);
+  const id = 'web-' + now() + '-' + (S.nkn.nextId++);
   const ctx = {
     id,
     onBegin: handlers.onBegin || null,
@@ -434,31 +666,20 @@ async function nknSendRelayStream(reqSpec, handlers={}, timeoutMs=180000){
     expected: 1,
     buff: new Map(),
     maxSeq: 0,
-    lastHeartbeat: Date.now(),
+    lastHeartbeat: now(),
     ended: false,
     finalizeTimer: null,
     resolved: false
   };
   const p = new Promise((resolve, reject)=>{
-    ctx.onResolve = (m)=>{
-      if (ctx.resolved) return;
-      ctx.resolved = true;
-      try { ctx.onEnd && ctx.onEnd(m); } catch {}
-      resolve(m);
-    };
-    ctx.onReject = (e)=>{
-      if (ctx.resolved) return;
-      ctx.resolved = true;
-      reject(e);
-    };
+    ctx.onResolve = (m)=>{ if (ctx.resolved) return; ctx.resolved = true; try{ ctx.onEnd && ctx.onEnd(m) }catch{} resolve(m); };
+    ctx.onReject  = (e)=>{ if (ctx.resolved) return; ctx.resolved = true; reject(e); };
   });
-
   S.nkn.streams.set(id, ctx);
 
   const data = { event:'http.request', id, req: Object.assign({ stream:'chunks' }, reqSpec) };
   const timer = setTimeout(()=>{
     if (S.nkn.streams.has(id)){
-      // flush what we have, then error out
       try { _drainOrderedLines(ctx, true); } catch {}
       S.nkn.streams.delete(id);
       ctx.onReject && ctx.onReject(new Error('NKN relay timeout'));
@@ -472,7 +693,7 @@ async function nknSendRelayStream(reqSpec, handlers={}, timeoutMs=180000){
 async function nknSendRelay(reqSpec, timeoutMs=45000){
   if (!S.relayAddr) throw new Error('No relay address set');
   await nknWaitReady();
-  const client = S.nkn.client; const id = 'web-' + Date.now() + '-' + (S.nkn.nextId++);
+  const client = S.nkn.client; const id = 'web-' + now() + '-' + (S.nkn.nextId++);
   const data = { event:'http.request', id, req: reqSpec };
   return new Promise((resolve, reject)=>{
     const timer = setTimeout(()=>{ S.nkn.pending.delete(id); reject(new Error('NKN relay timeout')); }, timeoutMs);
@@ -507,7 +728,24 @@ function _scheduleFinalize(ctx, reason){
   }, STREAM_GRACE_MS);
 }
 
-/* ===================== HTTP/Relay CALLS ===================== */
+/* ===================== HTTP/Relay CALLS (with base ping) ===================== */
+async function httpPingBase(){
+  try{
+    const res = await fetch(S.base.replace(/\/+$/, '')+'/api/version', { headers: authHeaders() });
+    if (res.ok){
+      S.http.healthy = true;
+      S.http.lastSeen = now();
+      return true;
+    }
+  }catch{}
+  S.http.healthy = false;
+  return false;
+}
+function startHttpPingLoop(){
+  clearInterval(S.http.pingTimer);
+  S.http.pingTimer = setInterval(()=>{ if (S.transport==='http') httpPingBase().catch(()=>{}) }, HTTP_PING_EVERY_MS);
+}
+
 async function callJSON(path, bodyObj, extraHeaders, method='POST'){
   if (S.transport === 'nkn'){
     const req = { url: S.base.replace(/\/+$/, '')+path, method, headers: authHeaders(extraHeaders||{}), json: bodyObj ?? {}, timeout_ms: 120000 };
@@ -557,98 +795,6 @@ async function postBlob(digest, file){
   }
 }
 
-/* ===================== MODELS DROPDOWN ===================== */
-function splitModelName(name){
-  const i = name.lastIndexOf(':');
-  if (i === -1) return { base: name, tag:'latest', full: name };
-  return { base: name.slice(0,i), tag: name.slice(i+1)||'latest', full: name };
-}
-function naturalTagSort(a,b){
-  const ax=a.toLowerCase(), bx=b.toLowerCase();
-  if (ax==='latest' && bx!=='latest') return 1;
-  if (bx==='latest' && ax!=='latest') return -1;
-  const rex=/^(\d+(?:\.\d+)?)\s*([kmgbt]*)$/;
-  const pa=ax.match(rex), pb=bx.match(rex);
-  if (pa && pb){
-    const na=parseFloat(pa[1]), nb=parseFloat(pb[1]);
-    if (!Number.isNaN(na) && !Number.isNaN(nb)){
-      if (na!==nb) return na-nb;
-      return ax.localeCompare(bx);
-    }
-  }
-  const pba=ax.match(/^(\d+(?:\.\d+)?)b$/), pbb=bx.match(/^(\d+(?:\.\d+)?)b$/);
-  if (pba && pbb){
-    const na=parseFloat(pba[1]), nb=parseFloat(pbb[1]);
-    if (na!==nb) return na-nb;
-  }
-  return ax.localeCompare(bx);
-}
-async function refreshModels(){
-  if (S._modelsReqInFlight) return;
-  S._modelsReqInFlight = true;
-  S._modelsLastReq = Date.now();
-  S._modelsRequestsIssued++;
-
-  try{
-    const data = await getJSON('/api/tags');
-    const list = Array.isArray(data?.models) ? data.models : [];
-
-    const groups = new Map();
-    for (const m of list){
-      const nm = typeof m?.name === 'string' ? m.name : (typeof m?.model === 'string' ? m.model : null);
-      if (!nm) continue;
-      const { base, tag, full } = splitModelName(nm);
-      if (!groups.has(base)) groups.set(base, { tags: new Set(), byTag: new Map() });
-      const g = groups.get(base);
-      g.tags.add(tag);
-      g.byTag.set(tag, { full, tag, base, details: m?.details || {}, raw: m });
-    }
-
-    const sel = qs('chatModelSelect');
-    sel.innerHTML = '';
-    const bases = Array.from(groups.keys()).sort((a,b)=>a.localeCompare(b, undefined, { numeric:true }));
-    for (const base of bases){
-      const g = groups.get(base);
-      const tags = Array.from(g.tags).sort(naturalTagSort);
-      const og = document.createElement('optgroup');
-      og.label = base;
-      for (const tag of tags){
-        const mo = g.byTag.get(tag);
-        const opt = document.createElement('option');
-        opt.value = mo.full;
-        const sz = mo.details?.parameter_size ? ` · ${mo.details.parameter_size}` : '';
-        const ql = mo.details?.quantization_level ? ` · ${mo.details.quantization_level}` : '';
-        opt.textContent = `${tag}${sz}${ql}`;
-        og.appendChild(opt);
-      }
-      sel.appendChild(og);
-    }
-
-    S.models = bases.flatMap(base=>{
-      const g = groups.get(base);
-      return Array.from(g.tags).map(tag=>g.byTag.get(tag).full);
-    });
-
-    const want = S.chat.currentModel && S.models.includes(S.chat.currentModel)
-      ? S.chat.currentModel
-      : (S.models[0] || null);
-    S.chat.currentModel = want;
-    if (want) sel.value = want;
-
-    toast('Models loaded');
-
-    if (!S.models.length) ensureModelsLoadedWithRetry(5000);
-    else { clearTimeout(S._modelsRetryTimer); S._modelsRetryTimer = null; }
-
-    renderSessionListForModel();
-  } catch(e){
-    toast('Load models failed', false);
-    if (!S.models.length) ensureModelsLoadedWithRetry(5000);
-  } finally {
-    S._modelsReqInFlight = false;
-  }
-}
-
 /* ===================== CHAT PERSISTENCE ===================== */
 function loadChatStore(){ try{ const raw=localStorage.getItem(S.chat.key); const obj = raw?JSON.parse(raw):{}; S.chat.byModel = obj.byModel || {}; } catch{ S.chat.byModel = {}; } }
 function saveChatStore(){ const payload={ byModel: S.chat.byModel }; localStorage.setItem(S.chat.key, JSON.stringify(payload)); }
@@ -656,17 +802,18 @@ function ensureModelBucket(model){ if (!S.chat.byModel[model]) S.chat.byModel[mo
 function newSession(model, name){
   const bucket=ensureModelBucket(model);
   const sid = model + '-' + Date.now().toString(36);
-  bucket.sessions[sid] = { name: name || 'Session ' + new Date().toLocaleString(), system:'', messages:[], updatedAt: Date.now() };
+  bucket.sessions[sid] = { name: name || 'Session ' + new Date().toLocaleString(), system:'', messages:[], updatedAt: now() };
   bucket.lastUsedSid = sid; saveChatStore(); return sid;
 }
-function renameSession(model, sid, name){ const b=ensureModelBucket(model); if (b.sessions[sid]){ b.sessions[sid].name = name || b.sessions[sid].name; b.sessions[sid].updatedAt = Date.now(); saveChatStore(); } }
+function renameSession(model, sid, name){ const b=ensureModelBucket(model); if (b.sessions[sid]){ b.sessions[sid].name = name || b.sessions[sid].name; b.sessions[sid].updatedAt = now(); saveChatStore(); } }
 function deleteSession(model, sid){ const b=ensureModelBucket(model); delete b.sessions[sid]; if (b.lastUsedSid===sid) b.lastUsedSid = Object.keys(b.sessions)[0] || null; saveChatStore(); }
 function listSessions(model){ return Object.entries(ensureModelBucket(model).sessions).sort((a,b)=> (b[1].updatedAt||0) - (a[1].updatedAt||0)); }
 
 /* ===================== CHAT UI RENDER ===================== */
 function renderSessionListForModel(){
   const model=S.chat.currentModel; if (!model) return;
-  const sel = qs('chatSessionSelect'); sel.innerHTML='';
+  const sel = qs('chatSessionSelect'); if (!sel) return;
+  sel.innerHTML='';
   const bucket = ensureModelBucket(model);
   if (!bucket.lastUsedSid) bucket.lastUsedSid = newSession(model);
   for (const [sid, sess] of listSessions(model)){
@@ -679,15 +826,15 @@ function renderSessionListForModel(){
 function renderChatSession(){
   const model=S.chat.currentModel; const sid=S.chat.sid; if (!model || !sid) return;
   const sess=ensureModelBucket(model).sessions[sid]; if (!sess) return;
-  qs('chatSystem').value = sess.system || '';
-  const list=qs('chatMsgList'); list.innerHTML='';
+  const sys = qs('chatSystem'); if (sys) sys.value = sess.system || '';
+  const list=qs('chatMsgList'); if (!list) return; list.innerHTML='';
   for (const m of sess.messages){
     const d=document.createElement('div'); d.className='bubble ' + (m.role==='user'?'user':'assistant'); d.textContent = m.content || ''; list.appendChild(d);
   }
   list.scrollTop = list.scrollHeight;
 }
 function upsertAssistantInFlight(textChunk){
-  const list=qs('chatMsgList');
+  const list=qs('chatMsgList'); if (!list) return;
   let last=list.lastElementChild;
   if (!last || !last.classList.contains('assistant')){
     last = document.createElement('div'); last.className='bubble assistant'; last.textContent=''; list.appendChild(last);
@@ -698,24 +845,24 @@ function upsertAssistantInFlight(textChunk){
 
 /* ===================== CHAT ACTIONS ===================== */
 function currentSession(){ const model=S.chat.currentModel; const sid=S.chat.sid; if(!model||!sid) return null; return ensureModelBucket(model).sessions[sid]; }
-function setSystemFromUI(){ const sess=currentSession(); if(!sess) return; sess.system = qs('chatSystem').value || ''; sess.updatedAt=Date.now(); saveChatStore(); }
-function pushUserMessage(txt){ const sess=currentSession(); if(!sess) return; sess.messages.push({ role:'user', content: txt }); sess.updatedAt=Date.now(); saveChatStore(); }
+function setSystemFromUI(){ const sess=currentSession(); if(!sess) return; const el=qs('chatSystem'); sess.system = el? (el.value||'') : ''; sess.updatedAt=now(); saveChatStore(); }
+function pushUserMessage(txt){ const sess=currentSession(); if(!sess) return; sess.messages.push({ role:'user', content: txt }); sess.updatedAt=now(); saveChatStore(); }
 function pushAssistantMessageFinal(txt){
   const sess=currentSession(); if(!sess) return;
   const last=sess.messages[sess.messages.length-1];
   if (last && last.role==='assistant'){ last.content = (last.content||'') + txt; }
   else sess.messages.push({ role:'assistant', content: txt });
-  sess.updatedAt=Date.now(); saveChatStore();
+  sess.updatedAt=now(); saveChatStore();
 }
 function startAssistantInFlight(){
   const sess=currentSession(); if(!sess) return;
   const last=sess.messages[sess.messages.length-1];
   if (last && last.role==='assistant') return;
-  sess.messages.push({ role:'assistant', content:'' }); sess.updatedAt=Date.now(); saveChatStore();
+  sess.messages.push({ role:'assistant', content:'' }); sess.updatedAt=now(); saveChatStore();
 }
 function appendAssistantInFlight(txt){
   const sess=currentSession(); if(!sess) return;
-  const last=sess.messages[sess.messages.length-1]; if (last && last.role==='assistant'){ last.content = (last.content||'') + txt; sess.updatedAt=Date.now(); saveChatStore(); }
+  const last=sess.messages[sess.messages.length-1]; if (last && last.role==='assistant'){ last.content = (last.content||'') + txt; sess.updatedAt=now(); saveChatStore(); }
 }
 function assembleAPIMessages(sess){
   const arr=[];
@@ -726,11 +873,7 @@ function assembleAPIMessages(sess){
 
 /* ===================== STREAM PARSE ===================== */
 const EOT_TOKENS = ["<|eot_id|>", "</s>"];
-function stripEOT(s){
-  let out = s;
-  for (const tok of EOT_TOKENS){ if (!tok) continue; out = out.split(tok).join(''); }
-  return out;
-}
+function stripEOT(s){ let out=s; for (const tok of EOT_TOKENS){ if (!tok) continue; out = out.split(tok).join(''); } return out; }
 function processNdjsonLine(line, kind){
   try{
     const obj = JSON.parse(line);
@@ -744,23 +887,21 @@ function processNdjsonLine(line, kind){
       if (typeof obj.response === 'string') return { type:'delta', text: stripEOT(obj.response), done: !!obj.done };
       return { type:'meta', obj };
     }
-  }catch{
-    return { type:'text', text: line };
-  }
+  }catch{ return { type:'text', text: line }; }
 }
 
 /* ===================== CHAT SEND ===================== */
 async function chatSend(){
   setSystemFromUI();
   const model=S.chat.currentModel;
-  const stream = qs('chatStream').value === 'true';
-  const userText = qs('chatUserInput').value; if (!userText.trim()){ toast('Type a message', false); return; }
-  pushUserMessage(userText); qs('chatUserInput').value=''; renderChatSession();
+  const stream = qs('chatStream')?.value === 'true';
+  const userEl = qs('chatUserInput'); const userText = userEl ? userEl.value : '';
+  if (!userText.trim()){ toast('Type a message', false); return; }
+  pushUserMessage(userText); if (userEl) userEl.value=''; renderChatSession();
 
   const sess=currentSession(); if (!sess) return;
   const payload={ model, messages: assembleAPIMessages(sess), stream };
 
-  // NKN streaming
   if (S.transport==='nkn' && stream){
     startAssistantInFlight();
     const req = { url: S.base.replace(/\/+$/, '')+'/api/chat', method:'POST', headers: authHeaders({ 'X-Relay-Stream':'chunks' }), json: payload, timeout_ms: 180000 };
@@ -768,25 +909,19 @@ async function chatSend(){
       onBegin: ()=>{},
       onLine: (line, seq, ts)=>{
         const ev=processNdjsonLine(line, 'chat');
-        if (ev.type==='delta' && ev.text){
-          appendAssistantInFlight(ev.text);
-          upsertAssistantInFlight(ev.text);
-        }
+        if (ev.type==='delta' && ev.text){ appendAssistantInFlight(ev.text); upsertAssistantInFlight(ev.text); }
       },
       onEnd: ()=>{}
     };
     try{
       await nknSendRelayStream(req, handlers, req.timeout_ms);
-      // Ensure UI reflects the final persisted assistant message (in case the last chunk arrived during grace window)
-      renderChatSession();
-      toast('Chat complete');
+      renderChatSession(); toast('Chat complete');
     }catch(e){
       upsertAssistantInFlight(`\n[error: ${e.message}]`); toast('Chat failed', false);
     }
     return;
   }
 
-  // HTTP streaming
   if (S.transport==='http' && stream){
     startAssistantInFlight();
     try{
@@ -795,7 +930,7 @@ async function chatSend(){
       const reader = res.body.getReader(); const decoder = new TextDecoder('utf-8'); let leftover='';
       while(true){
         const { value, done } = await reader.read(); if (done) break;
-        const s = decoder.decode(value); const combined = leftover + s; const lines = combined.split(/\r?\n/); leftover = lines.pop() || '';
+        const s = decoder.decode(value, { stream:true }); const combined = leftover + s; const lines = combined.split(/\r?\n/); leftover = lines.pop() || '';
         for (const ln of lines){
           if (!ln.trim()) continue;
           const ev = processNdjsonLine(ln, 'chat');
@@ -806,8 +941,7 @@ async function chatSend(){
         const ev = processNdjsonLine(leftover, 'chat');
         if (ev.type==='delta' && ev.text){ appendAssistantInFlight(ev.text); upsertAssistantInFlight(ev.text); }
       }
-      renderChatSession();
-      toast('Chat complete');
+      renderChatSession(); toast('Chat complete');
     }catch(e){
       upsertAssistantInFlight(`\n[error: ${e.message}]`); toast('Chat failed', false);
     }
@@ -826,23 +960,23 @@ async function chatSend(){
 
 /* ===================== GENERATE ===================== */
 async function doGenerate(){
-  const model = qs('genModel').value.trim(); if (!model){ toast('Enter a model', false); return; }
-  const prompt = qs('genPrompt').value;
-  const stream = qs('genStream').value === 'true';
-  const fmt = parseMaybeJSON(qs('genFormat').value);
-  const opts = parseMaybeJSON(qs('genOptions').value);
-  const out = qs('genOut'); out.style.display='block'; out.textContent='';
+  const model = qs('genModel')?.value.trim(); if (!model){ toast('Enter a model', false); return; }
+  const prompt = qs('genPrompt')?.value || '';
+  const stream = qs('genStream')?.value === 'true';
+  const fmt = parseMaybeJSON(qs('genFormat')?.value);
+  const opts = parseMaybeJSON(qs('genOptions')?.value);
+  const out = qs('genOut'); if (out){ out.style.display='block'; out.textContent=''; }
   const payload = { model, prompt, stream, ...(fmt!==undefined ? { format: fmt } : {}), ...(opts ? { options: opts } : {}) };
 
   if (S.transport==='nkn' && stream){
     const req = { url: S.base.replace(/\/+$/, '')+'/api/generate', method:'POST', headers: authHeaders({ 'X-Relay-Stream':'chunks' }), json: payload, timeout_ms: 180000 };
     const handlers = {
-      onBegin: ()=>{ out.textContent=''; },
-      onLine: (line)=>{ const ev=processNdjsonLine(line, 'generate'); if (ev.type==='delta' && ev.text){ out.textContent += ev.text; out.scrollTop = out.scrollHeight; } },
+      onBegin: ()=>{ if (out) out.textContent=''; },
+      onLine: (line)=>{ const ev=processNdjsonLine(line, 'generate'); if (ev.type==='delta' && ev.text){ if(out){ out.textContent += ev.text; out.scrollTop = out.scrollHeight; } } },
       onEnd: ()=>{}
     };
     try { await nknSendRelayStream(req, handlers, req.timeout_ms); toast('Generate complete'); }
-    catch(e){ out.textContent += '\nError: ' + e.message; toast('Generate failed', false); }
+    catch(e){ if (out) out.textContent += '\nError: ' + e.message; toast('Generate failed', false); }
   } else if (S.transport==='http' && stream){
     try{
       const res = await fetch(S.base.replace(/\/+$/, '')+'/api/generate', { method:'POST', headers: authHeaders({'Content-Type':'application/json'}), body: JSON.stringify(payload) });
@@ -850,39 +984,39 @@ async function doGenerate(){
       const reader=res.body.getReader(); const decoder=new TextDecoder('utf-8'); let leftover='';
       while(true){
         const { value, done } = await reader.read(); if (done) break;
-        const s=decoder.decode(value); const combined=leftover+s; const lines=combined.split(/\r?\n/); leftover = lines.pop() || '';
-        for (const ln of lines){ if (!ln.trim()) continue; const ev=processNdjsonLine(ln,'generate'); if (ev.type==='delta' && ev.text){ out.textContent += ev.text; out.scrollTop = out.scrollHeight; } }
+        const s=decoder.decode(value, { stream:true }); const combined=leftover+s; const lines=combined.split(/\r?\n/); leftover = lines.pop() || '';
+        for (const ln of lines){ if (!ln.trim()) continue; const ev=processNdjsonLine(ln,'generate'); if (ev.type==='delta' && ev.text){ if(out){ out.textContent += ev.text; out.scrollTop = out.scrollHeight; } } }
       }
-      if (leftover){ const ev=processNdjsonLine(leftover,'generate'); if (ev.type==='delta' && ev.text) out.textContent += ev.text; }
+      if (leftover){ const ev=processNdjsonLine(leftover,'generate'); if (ev.type==='delta' && ev.text && out) out.textContent += ev.text; }
       toast('Generate complete');
-    }catch(e){ out.textContent += '\nError: ' + e.message; toast('Generate failed', false); }
+    }catch(e){ if (out) out.textContent += '\nError: ' + e.message; toast('Generate failed', false); }
   } else {
-    try { out.textContent = j(await callJSON('/api/generate', payload)); toast('Generate complete'); }
-    catch(e){ out.textContent = 'Error: ' + e.message; toast('Generate failed', false); }
+    try { if (out) out.textContent = j(await callJSON('/api/generate', payload)); toast('Generate complete'); }
+    catch(e){ if (out) out.textContent = 'Error: ' + e.message; toast('Generate failed', false); }
   }
 }
 
 /* ===================== INSPECT ===================== */
-async function listModels(){ const box=qs('inspectBox'); box.style.display='block'; try{ box.textContent = j(await getJSON('/api/tags')); toast('Loaded models'); }catch(e){ box.textContent='Error: '+e.message; toast('Models error', false); } }
-async function listPS(){ const box=qs('inspectBox'); box.style.display='block'; try{ box.textContent = j(await getJSON('/api/ps')); toast('Loaded running models'); }catch(e){ box.textContent='Error: '+e.message; toast('PS error', false); } }
-async function getVersion(){ const box=qs('inspectBox'); box.style.display='block'; try{ box.textContent = j(await getJSON('/api/version')); toast('Got version'); }catch(e){ box.textContent='Error: '+e.message; toast('Version error', false); } }
+async function listModels(){ const box=qs('inspectBox'); if (box){ box.style.display='block'; } try{ if (box) box.textContent = j(await getJSON('/api/tags')); toast('Loaded models'); }catch(e){ if (box) box.textContent='Error: '+e.message; toast('Models error', false); } }
+async function listPS(){ const box=qs('inspectBox'); if (box){ box.style.display='block'; } try{ if (box) box.textContent = j(await getJSON('/api/ps')); toast('Loaded running models'); }catch(e){ if (box) box.textContent='Error: '+e.message; toast('PS error', false); } }
+async function getVersion(){ const box=qs('inspectBox'); if (box){ box.style.display='block'; } try{ if (box) box.textContent = j(await getJSON('/api/version')); toast('Got version'); }catch(e){ if (box) box.textContent='Error: '+e.message; toast('Version error', false); } }
 
 /* ===================== ADMIN ===================== */
 async function createFromModel(){
-  const model = qs('createModelName').value.trim(); if (!model){ toast('Enter new model name', false); return; }
+  const model = qs('createModelName')?.value.trim(); if (!model){ toast('Enter new model name', false); return; }
   const from = prompt('From base model (e.g. llama3.2 or llama3.1:8b-instruct-fp16)?', 'llama3.2') || '';
-  const system = qs('createSystem').value || undefined;
-  const template = qs('createTemplate').value || undefined;
-  const parameters = parseMaybeJSON(qs('createParams').value);
-  const messages = parseMaybeJSON(qs('createMessages').value);
+  const system = qs('createSystem')?.value || undefined;
+  const template = qs('createTemplate')?.value || undefined;
+  const parameters = parseMaybeJSON(qs('createParams')?.value);
+  const messages = parseMaybeJSON(qs('createMessages')?.value);
   const body = { model, ...(from?{from}:{}) , ...(system?{system}:{}) , ...(template?{template}:{}) , ...(parameters?{parameters}:{}) , ...(Array.isArray(messages)?{messages}:{}) , stream:true };
-  const box=qs('adminOut'); box.style.display='block'; box.textContent='(creating…)\n';
+  const box=qs('adminOut'); if (box){ box.style.display='block'; box.textContent='(creating…)\n'; }
 
   if (S.transport==='nkn'){
     const req = { url: S.base.replace(/\/+$/, '')+'/api/create', method:'POST', headers: authHeaders({ 'X-Relay-Stream':'chunks' }), json: body, timeout_ms: 20*60*1000 };
-    const h = { onBegin: ()=>{}, onLine: (line)=>{ box.textContent += '\n' + line; box.scrollTop = box.scrollHeight; }, onEnd: ()=>{} };
-    try { await nknSendRelayStream(req, h, req.timeout_ms); toast('Create finished'); refreshModels(); }
-    catch(e){ box.textContent += '\nError: ' + e.message; toast('Create failed', false); }
+    const h = { onBegin: ()=>{}, onLine: (line)=>{ if (box){ box.textContent += '\n' + line; box.scrollTop = box.scrollHeight; } }, onEnd: ()=>{} };
+    try { await nknSendRelayStream(req, h, req.timeout_ms); toast('Create finished'); refreshModels(true); }
+    catch(e){ if (box) box.textContent += '\nError: ' + e.message; toast('Create failed', false); }
   } else {
     try{
       const res = await fetch(S.base.replace(/\/+$/, '')+'/api/create', { method:'POST', headers: authHeaders({'Content-Type':'application/json'}), body: JSON.stringify(body) });
@@ -890,45 +1024,45 @@ async function createFromModel(){
       const reader=res.body.getReader(); const decoder=new TextDecoder('utf-8'); let leftover='';
       while(true){
         const { value, done } = await reader.read(); if (done) break;
-        const s=decoder.decode(value); const combined=leftover+s; const lines=combined.split(/\r?\n/); leftover = lines.pop() || '';
-        for (const ln of lines){ if (!ln.trim()) continue; box.textContent += '\n' + ln; box.scrollTop = box.scrollHeight; }
+        const s=decoder.decode(value, { stream:true }); const combined=leftover+s; const lines=combined.split(/\r?\n/); leftover = lines.pop() || '';
+        for (const ln of lines){ if (!ln.trim()) continue; if (box){ box.textContent += '\n' + ln; box.scrollTop = box.scrollHeight; } }
       }
-      if (leftover) box.textContent += '\n' + leftover;
-      toast('Create finished'); refreshModels();
-    }catch(e){ box.textContent += '\nError: ' + e.message; toast('Create failed', false); }
+      if (leftover && box) box.textContent += '\n' + leftover;
+      toast('Create finished'); refreshModels(true);
+    }catch(e){ if (box) box.textContent += '\nError: ' + e.message; toast('Create failed', false); }
   }
 }
 async function showModel(){
-  const model = qs('showModel').value.trim(); if (!model){ toast('Enter model', false); return; }
-  const verbose = qs('showVerbose').value === 'true';
-  const box=qs('adminOut'); box.style.display='block';
-  try{ box.textContent = j(await callJSON('/api/show', { model, ...(verbose?{verbose:true}:{}) })); toast('Show ok'); }
-  catch(e){ box.textContent='Error: '+e.message; toast('Show error', false); }
+  const model = qs('showModel')?.value.trim(); if (!model){ toast('Enter model', false); return; }
+  const verbose = qs('showVerbose')?.value === 'true';
+  const box=qs('adminOut'); if (box){ box.style.display='block'; }
+  try{ if (box) box.textContent = j(await callJSON('/api/show', { model, ...(verbose?{verbose:true}:{}) })); toast('Show ok'); }
+  catch(e){ if (box) box.textContent='Error: '+e.message; toast('Show error', false); }
 }
 async function copyModel(){
-  const src=qs('copySrc').value.trim(), dst=qs('copyDst').value.trim(); if (!src || !dst){ toast('Enter source & destination', false); return; }
-  const box=qs('adminOut'); box.style.display='block';
-  try{ box.textContent = j(await callJSON('/api/copy', { source: src, destination: dst })); toast('Copy ok'); refreshModels(); }
-  catch(e){ box.textContent='Error: '+e.message; toast('Copy error', false); }
+  const src=qs('copySrc')?.value.trim(), dst=qs('copyDst')?.value.trim(); if (!src || !dst){ toast('Enter source & destination', false); return; }
+  const box=qs('adminOut'); if (box){ box.style.display='block'; }
+  try{ if (box) box.textContent = j(await callJSON('/api/copy', { source: src, destination: dst })); toast('Copy ok'); refreshModels(true); }
+  catch(e){ if (box) box.textContent='Error: '+e.message; toast('Copy error', false); }
 }
 async function deleteModel(){
-  const model = qs('deleteModel').value.trim(); if (!model){ toast('Enter model to delete', false); return; }
-  const box=qs('adminOut'); box.style.display='block';
-  try{ box.textContent = j(await callJSON('/api/delete', { model }, undefined, 'DELETE')); toast('Delete ok'); refreshModels(); }
-  catch(e){ box.textContent='Error: '+e.message; toast('Delete error', false); }
+  const model = qs('deleteModel')?.value.trim(); if (!model){ toast('Enter model to delete', false); return; }
+  const box=qs('adminOut'); if (box){ box.style.display='block'; }
+  try{ if (box) box.textContent = j(await callJSON('/api/delete', { model }, undefined, 'DELETE')); toast('Delete ok'); refreshModels(true); }
+  catch(e){ if (box) box.textContent='Error: '+e.message; toast('Delete error', false); }
 }
 
 /* ===================== PULL / PUSH / EMBEDDINGS / BLOBS ===================== */
 async function pullModel(){
-  const name = qs('pullModelName').value.trim(); if (!name){ toast('Enter a model', false); return; }
+  const name = qs('pullModelName')?.value.trim(); if (!name){ toast('Enter a model', false); return; }
   const body={ model:name, stream:true };
-  const box=qs('pullPushOut'); box.style.display='block'; box.textContent='(pulling…)\n';
+  const box=qs('pullPushOut'); if (box){ box.style.display='block'; box.textContent='(pulling…)\n'; }
 
   if (S.transport==='nkn'){
     const req = { url: S.base.replace(/\/+$/, '')+'/api/pull', method:'POST', headers: authHeaders({ 'X-Relay-Stream':'chunks' }), json: body, timeout_ms: 60*60*1000 };
-    const h = { onBegin: ()=>{}, onLine: (line)=>{ box.textContent+='\n'+line; box.scrollTop=box.scrollHeight; }, onEnd: ()=>{} };
-    try { await nknSendRelayStream(req, h, req.timeout_ms); toast('Pull finished'); refreshModels(); }
-    catch(e){ box.textContent += '\nError: ' + e.message; toast('Pull failed', false); }
+    const h = { onBegin: ()=>{}, onLine: (line)=>{ if (box){ box.textContent+='\n'+line; box.scrollTop=box.scrollHeight; } }, onEnd: ()=>{} };
+    try { await nknSendRelayStream(req, h, req.timeout_ms); toast('Pull finished'); refreshModels(true); }
+    catch(e){ if (box) box.textContent += '\nError: ' + e.message; toast('Pull failed', false); }
   } else {
     try{
       const res = await fetch(S.base.replace(/\/+$/, '')+'/api/pull', { method:'POST', headers: authHeaders({'Content-Type':'application/json'}), body: JSON.stringify(body) });
@@ -936,24 +1070,24 @@ async function pullModel(){
       const reader=res.body.getReader(); const decoder=new TextDecoder('utf-8'); let leftover='';
       while(true){
         const { value, done } = await reader.read(); if (done) break;
-        const s=decoder.decode(value); const combined=leftover+s; const lines=combined.split(/\r?\n/); leftover = lines.pop() || '';
-        for (const ln of lines){ if (!ln.trim()) continue; box.textContent+='\n'+ln; box.scrollTop=box.scrollHeight; }
+        const s=decoder.decode(value, { stream:true }); const combined=leftover+s; const lines=combined.split(/\r?\n/); leftover = lines.pop() || '';
+        for (const ln of lines){ if (!ln.trim()) continue; if (box){ box.textContent+='\n'+ln; box.scrollTop=box.scrollHeight; } }
       }
-      if (leftover) box.textContent+='\n'+leftover;
-      toast('Pull finished'); refreshModels();
-    }catch(e){ box.textContent += '\nError: ' + e.message; toast('Pull failed', false); }
+      if (leftover && box) box.textContent+='\n'+leftover;
+      toast('Pull finished'); refreshModels(true);
+    }catch(e){ if (box) box.textContent += '\nError: ' + e.message; toast('Pull failed', false); }
   }
 }
 async function pushModel(){
-  const name = qs('pushModelName').value.trim(); if (!name){ toast('Enter namespace/model:tag', false); return; }
+  const name = qs('pushModelName')?.value.trim(); if (!name){ toast('Enter namespace/model:tag', false); return; }
   const body={ model:name, stream:true };
-  const box=qs('pullPushOut'); box.style.display='block'; box.textContent='(pushing…)\n';
+  const box=qs('pullPushOut'); if (box){ box.style.display='block'; box.textContent='(pushing…)\n'; }
 
   if (S.transport==='nkn'){
     const req = { url: S.base.replace(/\/+$/, '')+'/api/push', method:'POST', headers: authHeaders({ 'X-Relay-Stream':'chunks' }), json: body, timeout_ms: 60*60*1000 };
-    const h = { onBegin: ()=>{}, onLine: (line)=>{ box.textContent+='\n'+line; box.scrollTop=box.scrollHeight; }, onEnd: ()=>{} };
-    try { await nknSendRelayStream(req, h, req.timeout_ms); toast('Push finished'); refreshModels(); }
-    catch(e){ box.textContent += '\nError: ' + e.message; toast('Push failed', false); }
+    const h = { onBegin: ()=>{}, onLine: (line)=>{ if (box){ box.textContent+='\n'+line; box.scrollTop=box.scrollHeight; } }, onEnd: ()=>{} };
+    try { await nknSendRelayStream(req, h, req.timeout_ms); toast('Push finished'); refreshModels(true); }
+    catch(e){ if (box) box.textContent += '\nError: ' + e.message; toast('Push failed', false); }
   } else {
     try{
       const res = await fetch(S.base.replace(/\/+$/, '')+'/api/push', { method:'POST', headers: authHeaders({'Content-Type':'application/json'}), body: JSON.stringify(body) });
@@ -961,138 +1095,177 @@ async function pushModel(){
       const reader=res.body.getReader(); const decoder=new TextDecoder('utf-8'); let leftover='';
       while(true){
         const { value, done } = await reader.read(); if (done) break;
-        const s=decoder.decode(value); const combined=leftover+s; const lines=combined.split(/\r?\n/); leftover = lines.pop() || '';
-        for (const ln of lines){ if (!ln.trim()) continue; box.textContent+='\n'+ln; box.scrollTop=box.scrollHeight; }
+        const s=decoder.decode(value, { stream:true }); const combined=leftover+s; const lines=combined.split(/\r?\n/); leftover = lines.pop() || '';
+        for (const ln of lines){ if (!ln.trim()) continue; if (box){ box.textContent+='\n'+ln; box.scrollTop=box.scrollHeight; } }
       }
-      if (leftover) box.textContent+='\n'+leftover;
-      toast('Push finished'); refreshModels();
-    }catch(e){ box.textContent += '\nError: ' + e.message; toast('Push failed', false); }
+      if (leftover && box) box.textContent+='\n'+leftover;
+      toast('Push finished'); refreshModels(true);
+    }catch(e){ if (box) box.textContent += '\nError: ' + e.message; toast('Push failed', false); }
   }
 }
 async function doEmbeddings(){
-  const model = qs('embModel').value.trim(); if (!model){ toast('Enter an embedding model', false); return; }
-  const endpoint = qs('embEndpoint').value;
-  const input = parseMaybeJSON(qs('embInput').value) ?? '';
-  const options = parseMaybeJSON(qs('embOptions').value);
-  const keep_alive = qs('embKeepAlive').value.trim();
-  const out=qs('embOut'); out.style.display='block'; out.textContent='(requesting)…';
+  const model = qs('embModel')?.value.trim(); if (!model){ toast('Enter an embedding model', false); return; }
+  const endpoint = qs('embEndpoint')?.value || 'embed';
+  const input = parseMaybeJSON(qs('embInput')?.value) ?? '';
+  const options = parseMaybeJSON(qs('embOptions')?.value);
+  const keep_alive = qs('embKeepAlive')?.value.trim();
+  const out=qs('embOut'); if (out){ out.style.display='block'; out.textContent='(requesting)…'; }
   try{
     if (endpoint==='embed'){
       const body={ model, input, ...(options?{options}:{}) , ...(keep_alive?{keep_alive}:{}) };
-      out.textContent = j(await callJSON('/api/embed', body));
+      const resp = await callJSON('/api/embed', body);
+      if (out) out.textContent = j(resp);
     } else {
       const body={ model, prompt: (typeof input==='string' ? input : JSON.stringify(input)), ...(options?{options}:{}) , ...(keep_alive?{keep_alive}:{}) };
-      out.textContent = j(await callJSON('/api/embeddings', body));
+      const resp = await callJSON('/api/embeddings', body);
+      if (out) out.textContent = j(resp);
     }
     toast('Embeddings complete');
-  }catch(e){ out.textContent = 'Error: ' + e.message; toast('Embeddings failed', false); }
+  }catch(e){ if (out) out.textContent = 'Error: ' + e.message; toast('Embeddings failed', false); }
 }
 async function sha256Hex(file){
   const buf=await file.arrayBuffer(); const hash=await crypto.subtle.digest('SHA-256', buf);
   const arr=Array.from(new Uint8Array(hash)); return 'sha256:'+arr.map(b=>b.toString(16).padStart(2,'0')).join('');
 }
 async function blobHead(){
-  const d=qs('blobDigest').value.trim(); if (!d){ toast('Enter digest', false); return; }
-  const box=qs('blobOut'); box.style.display='block';
-  try{ const r=await headBlob(d); box.textContent = `HEAD ${d} → ${r.status}\n`+j(r.headers); toast(r.status===200?'Blob exists':'Not found', r.status===200); }
-  catch(e){ box.textContent = 'Error: ' + e.message; toast('HEAD error', false); }
+  const d=qs('blobDigest')?.value.trim(); if (!d){ toast('Enter digest', false); return; }
+  const box=qs('blobOut'); if (box){ box.style.display='block'; }
+  try{ const r=await headBlob(d); if (box) box.textContent = `HEAD ${d} → ${r.status}\n`+j(r.headers); toast(r.status===200?'Blob exists':'Not found', r.status===200); }
+  catch(e){ if (box) box.textContent = 'Error: ' + e.message; toast('HEAD error', false); }
 }
 async function blobPush(){
-  const input=qs('blobFile'); const file=input.files && input.files[0]; if (!file){ toast('Choose a file', false); return; }
-  const box=qs('blobOut'); box.style.display='block'; box.textContent='(hashing file…)\n';
-  let digest=qs('blobDigest').value.trim();
-  if (!digest){ digest=await sha256Hex(file); qs('blobDigest').value=digest; box.textContent += `Computed digest: ${digest}\n`; }
+  const input=qs('blobFile'); const file=input?.files && input.files[0]; if (!file){ toast('Choose a file', false); return; }
+  const box=qs('blobOut'); if (box){ box.style.display='block'; box.textContent='(hashing file…)\n'; }
+  let digest=qs('blobDigest')?.value.trim();
+  if (!digest){ digest=await sha256Hex(file); if (qs('blobDigest')) qs('blobDigest').value=digest; if (box) box.textContent += `Computed digest: ${digest}\n`; }
   try{
     if (S.transport==='nkn' && file.size > 4*1024*1024){ throw new Error('File too large for NKN upload; switch transport to HTTP'); }
     const r=await postBlob(digest, file);
-    box.textContent += `POST ${digest} → ${r.status}\n`+j(r.headers);
+    if (box) box.textContent += `POST ${digest} → ${r.status}\n`+j(r.headers);
     toast(r.status===201?'Uploaded':'Done');
-  }catch(e){ box.textContent += 'Error: ' + e.message; toast('Upload error', false); }
+  }catch(e){ if (box) box.textContent += '\nError: ' + e.message; toast('Upload error', false); }
 }
 
 /* ===================== EVENTS ===================== */
 function reflectInputs(){
-  qs('transport').value=S.transport; qs('baseUrl').value=S.base; qs('relayAddr').value=S.relayAddr; qs('apiKey').value=S.apiKey;
+  if (qs('transport')) qs('transport').value=S.transport;
+  if (qs('baseUrl'))   qs('baseUrl').value=S.base;
+  if (qs('relayAddr')) qs('relayAddr').value=S.relayAddr;
+  if (qs('apiKey'))    qs('apiKey').value=S.apiKey;
 }
 function saveSettings(){
-  S.transport = qs('transport').value;
-  S.base = qs('baseUrl').value.trim() || S.base;
-  S.relayAddr = qs('relayAddr').value.trim();
-  S.apiKey = qs('apiKey').value.trim();
+  S.transport = qs('transport')?.value || S.transport;
+  S.base = (qs('baseUrl')?.value.trim() || S.base);
+  S.relayAddr = qs('relayAddr')?.value.trim() || '';
+  S.apiKey = qs('apiKey')?.value.trim() || '';
   localStorage.setItem('ollama.transport', S.transport);
   localStorage.setItem('ollama.base', S.base);
   localStorage.setItem('ollama.relayAddr', S.relayAddr);
   localStorage.setItem('ollama.apiKey', S.apiKey);
   toast('Saved settings'); reflectTransportUI();
+
+  // restart health loops / models poller
   if (S.transport==='nkn') nknEnsureClient();
-  refreshModels();
-  ensureModelsLoadedWithRetry(5000);
+  startHttpPingLoop();
+  _startModelsPoller();
+  refreshModels(true);
 }
 function bindEvents(){
-  qs('transport').addEventListener('change', saveSettings);
-  qs('nknConnectBtn').addEventListener('click', ()=>nknEnsureClient());
-  qs('nknDisconnectBtn').addEventListener('click', ()=>{ try{ S.nkn.client && S.nkn.client.close(); }catch{} S.nkn.client=null; S.nkn.ready=false; reflectTransportUI(); });
-  qs('saveBtn').addEventListener('click', saveSettings);
+  qs('transport')?.addEventListener('change', saveSettings);
+  qs('nknConnectBtn')?.addEventListener('click', ()=>nknEnsureClient());
+  qs('nknDisconnectBtn')?.addEventListener('click', ()=>{
+    try{ S.nkn.client && S.nkn.client.close(); }catch{}
+    S.nkn.client=null; S.nkn.ready=false;
+    reflectTransportUI();
+  });
+  qs('saveBtn')?.addEventListener('click', saveSettings);
 
   // Inspect
-  qs('listModels').addEventListener('click', listModels);
-  qs('listPS').addEventListener('click', listPS);
-  qs('getVersion').addEventListener('click', getVersion);
+  qs('listModels')?.addEventListener('click', listModels);
+  qs('listPS')?.addEventListener('click', listPS);
+  qs('getVersion')?.addEventListener('click', getVersion);
 
   // Generate
-  qs('genGo').addEventListener('click', doGenerate);
+  qs('genGo')?.addEventListener('click', doGenerate);
 
   // Chat & sessions
-  qs('chatModelSelect').addEventListener('change', (e)=>{ S.chat.currentModel=e.target.value; renderSessionListForModel(); saveChatStore(); });
-  qs('chatSessionSelect').addEventListener('change', (e)=>{ ensureModelBucket(S.chat.currentModel).lastUsedSid=e.target.value; S.chat.sid=e.target.value; saveChatStore(); renderChatSession(); });
-  qs('chatNewSession').addEventListener('click', ()=>{ const sid=newSession(S.chat.currentModel); renderSessionListForModel(); });
-  qs('chatRenameSession').addEventListener('click', ()=>{ const name=prompt('Session name?', currentSession()?.name || '') || ''; if (name){ renameSession(S.chat.currentModel, S.chat.sid, name); renderSessionListForModel(); } });
-  qs('chatDeleteSession').addEventListener('click', ()=>{ if (confirm('Delete this session?')){ deleteSession(S.chat.currentModel, S.chat.sid); renderSessionListForModel(); } });
-  qs('chatSystem').addEventListener('change', setSystemFromUI);
-  qs('chatSend').addEventListener('click', chatSend);
-  qs('chatUserInput').addEventListener('keydown', (e)=>{ if (e.key==='Enter' && (e.ctrlKey||e.metaKey)){ e.preventDefault(); chatSend(); } });
+  qs('chatModelSelect')?.addEventListener('change', (e)=>{ S.chat.currentModel=e.target.value; renderSessionListForModel(); saveChatStore(); });
+  qs('chatSessionSelect')?.addEventListener('change', (e)=>{ ensureModelBucket(S.chat.currentModel).lastUsedSid=e.target.value; S.chat.sid=e.target.value; saveChatStore(); renderChatSession(); });
+  qs('chatNewSession')?.addEventListener('click', ()=>{ const sid=newSession(S.chat.currentModel); renderSessionListForModel(); });
+  qs('chatRenameSession')?.addEventListener('click', ()=>{ const name=prompt('Session name?', currentSession()?.name || '') || ''; if (name){ renameSession(S.chat.currentModel, S.chat.sid, name); renderSessionListForModel(); } });
+  qs('chatDeleteSession')?.addEventListener('click', ()=>{ if (confirm('Delete this session?')){ deleteSession(S.chat.currentModel, S.chat.sid); renderSessionListForModel(); } });
+  qs('chatSystem')?.addEventListener('change', setSystemFromUI);
+  qs('chatSend')?.addEventListener('click', chatSend);
+  qs('chatUserInput')?.addEventListener('keydown', (e)=>{ if (e.key==='Enter' && (e.ctrlKey||e.metaKey)){ e.preventDefault(); chatSend(); } });
 
   // Upload/Download messages JSON
-  qs('chatDownload').addEventListener('click', ()=>{ const sess=currentSession(); if (!sess) return; downloadJSON((sess.name||'session')+'.json', sess.messages); });
-  qs('chatUpload').addEventListener('change', async (e)=>{
+  qs('chatDownload')?.addEventListener('click', ()=>{ const sess=currentSession(); if (!sess) return; downloadJSON((sess.name||'session')+'.json', sess.messages); });
+  qs('chatUpload')?.addEventListener('change', async (e)=>{
     const file=e.target.files && e.target.files[0]; if (!file) return;
     try{
       const txt=await file.text(); const arr=JSON.parse(txt);
       if (!Array.isArray(arr)) throw new Error('JSON must be an array of messages');
       const sess=currentSession(); if (!sess) return;
-      sess.messages = arr; sess.updatedAt=Date.now(); saveChatStore(); renderChatSession(); toast('Messages loaded');
+      sess.messages = arr; sess.updatedAt=now(); saveChatStore(); renderChatSession(); toast('Messages loaded');
     }catch(err){ toast('Upload failed: '+err.message, false); }
     e.target.value='';
   });
 
   // Admin
-  qs('createFromModel').addEventListener('click', createFromModel);
-  qs('showBtn').addEventListener('click', showModel);
-  qs('copyBtn').addEventListener('click', copyModel);
-  qs('deleteBtn').addEventListener('click', deleteModel);
+  qs('createFromModel')?.addEventListener('click', createFromModel);
+  qs('showBtn')?.addEventListener('click', showModel);
+  qs('copyBtn')?.addEventListener('click', copyModel);
+  qs('deleteBtn')?.addEventListener('click', deleteModel);
 
   // Pull / Push
-  qs('pullModel').addEventListener('click', pullModel);
-  qs('pushModel').addEventListener('click', pushModel);
+  qs('pullModel')?.addEventListener('click', pullModel);
+  qs('pushModel')?.addEventListener('click', pushModel);
 
   // Embeddings
-  qs('embGo').addEventListener('click', doEmbeddings);
+  qs('embGo')?.addEventListener('click', doEmbeddings);
 
   // Blobs
-  qs('blobHead').addEventListener('click', blobHead);
-  qs('blobPush').addEventListener('click', blobPush);
+  qs('blobHead')?.addEventListener('click', blobHead);
+  qs('blobPush')?.addEventListener('click', blobPush);
+
+  // Network visibility & online/offline
+  let visTimer=null;
+  document.addEventListener('visibilitychange', ()=>{
+    clearTimeout(visTimer);
+    visTimer = setTimeout(()=>{
+      if (!document.hidden){
+        refreshModels(true);
+        if (S.transport==='http') httpPingBase();
+        if (S.transport==='nkn') nknEnsureClient();
+      }
+    }, VISIBILITY_DEBOUNCE_MS);
+  });
+  window.addEventListener('online', ()=>{
+    toast('Network online'); refreshModels(true);
+    if (S.transport==='nkn') nknEnsureClient();
+    if (S.transport==='http') httpPingBase();
+  });
+  window.addEventListener('offline', ()=>{ toast('Network offline', false); });
 }
 
 /* ===================== INIT ===================== */
 function init(){
   loadChatStore();
   reflectInputs(); reflectTransportUI(); bindEvents();
+
+  // kick health loops
+  startHttpPingLoop();
+  _startModelsPoller();
+
   if (S.transport==='nkn') nknEnsureClient();
-  document.getElementById('status').innerHTML = `<span class="dot ok"></span><span>Ready</span>`;
-  refreshModels();
-  ensureModelsLoadedWithRetry(5000);
+
+  if (qs('status')) qs('status').innerHTML = `<span class="dot ok"></span><span>Ready</span>`;
+
+  // first-time model load + scheduled retry on failure handled inside
+  refreshModels(true);
 }
 document.addEventListener('DOMContentLoaded', init);
 </script>
+
 </body>
 </html>
