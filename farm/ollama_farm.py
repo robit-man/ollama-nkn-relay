@@ -295,7 +295,7 @@ def build_proxy(backend_url: str, host: str, concurrency: int):
 # ──────────────────────────────────────────────────────────────
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", required=True, default="gemma3:4b", help="model to warm (e.g. llama3:8b)")
+    ap.add_argument("--model", default="gemma3:4b", help="model to warm (e.g. llama3:8b)")
     ap.add_argument("--num-parallel", type=int, default=9)
     ap.add_argument("--gpu-layers", type=int, default=-1)
     ap.add_argument("--front-port", type=int, default=8080)
